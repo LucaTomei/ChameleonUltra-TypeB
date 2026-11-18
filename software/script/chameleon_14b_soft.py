@@ -22,6 +22,21 @@ ETU_SAMPLES = 128 / 13.56 / US_PER_SAMPLE   # ~9.42 samples per etu
 ETU_Q8 = round(ETU_SAMPLES * 256)
 ST25TB_MOD = dict(mod_reg=0x28, hi=0x3F, lo=0x09)   # CWGsPReg 0x3F -> 0x09 gives a usable ASK depth
 
+# Modulation settings that produced valid ST25TB answers, most reliable first.
+# Tried in order when the tag does not answer INITIATE (other distances/positions).
+MOD_CANDIDATES = [
+    ST25TB_MOD,
+    dict(mod_reg=0x28, hi=0x3F, lo=0x06),
+    dict(mod_reg=0x28, hi=0x3F, lo=0x0C),
+    dict(mod_reg=0x28, hi=0x3F, lo=0x03),
+    dict(mod_reg=0x28, hi=0x3F, lo=0x0F),
+    dict(mod_reg=0x28, hi=0x3F, lo=0x12),
+    dict(mod_reg=0x27, hi=0xF4, lo=0x44),   # GsNReg
+    dict(mod_reg=0x27, hi=0xF4, lo=0x24),
+    dict(mod_reg=0x14, hi=0x83, lo=0x82),   # TxControlReg: one TX driver off
+    dict(mod_reg=0x14, hi=0x83, lo=0x81),
+]
+
 
 def crc_14b(data) -> bytes:
     """CRC_B (ISO/IEC 13239, CRC-16/X-25), returned LSB first as sent on air."""
@@ -74,10 +89,10 @@ def _estimate_freq(seg):
     return best_f
 
 
-def bpsk_decode(samples, ch="Q"):
+def bpsk_decode(samples, ch="Q", thr=1.5):
     """Decode one ISO14443-B PICC frame from TestADCReg samples. Returns bytes (incl. CRC) or None."""
     sig = _channel(samples, ch)
-    span = _active_span(sig)
+    span = _active_span(sig, thr=thr)
     if span is None:
         return None
     a, b = span[0] + 2, span[1]
@@ -137,27 +152,36 @@ class SoftST25TB:
     def __init__(self, cmd, tries=6):
         self.cmd = cmd
         self.tries = tries
+        self.mod = ST25TB_MOD
 
-    def xfer(self, payload, n_samples, expect_len, reset=False):
+    def xfer(self, payload, n_samples, expect_len, reset=False, tries=None):
         frame = bytes(payload) + crc_14b(bytes(payload))
-        for _ in range(self.tries):
+        for _ in range(tries or self.tries):
             r = self.cmd.hf14b_bitbang(frame, etu_q8=ETU_Q8, rx_mode=2, n_samples=n_samples, sample_reg=0x3B,
-                                       timeout_ms=3, reset_field=reset, keep_field=True, **ST25TB_MOD)
+                                       timeout_ms=3, reset_field=reset, keep_field=True, **self.mod)
             reset = False
             if r["spi_check"][0] != 0x92:
                 raise RuntimeError(f"RC522 SPI desync after burst: {r['spi_check']}")
-            for ch in ("Q", "I"):
-                data = bpsk_decode(r["samples"], ch)
-                if data and crc_ok(data) and len(data) == expect_len:
-                    return data[:-2]
+            for thr in (1.5, 1.0):          # lower threshold for weaker (farther) answers
+                for ch in ("Q", "I"):
+                    data = bpsk_decode(r["samples"], ch, thr=thr)
+                    if data and crc_ok(data) and len(data) == expect_len:
+                        return data[:-2]
         return None
 
-    def initiate(self, attempts=10):
-        for _ in range(attempts):
-            resp = self.xfer([0x06, 0x00], 900, 3, reset=True)
+    def initiate(self, attempts=3):
+        """INITIATE with automatic modulation search; the working setting is kept for the session."""
+        for mod in MOD_CANDIDATES:
+            self.mod = mod
+            resp = self.xfer([0x06, 0x00], 900, 3, reset=True, tries=attempts)
             if resp:
                 return resp[0]
+        self.mod = ST25TB_MOD
         return None
+
+    def mod_str(self):
+        names = {0x28: "CWGsPReg", 0x27: "GsNReg", 0x14: "TxControlReg"}
+        return f"{names.get(self.mod['mod_reg'], hex(self.mod['mod_reg']))} 0x{self.mod['hi']:02X}/0x{self.mod['lo']:02X}"
 
     def select(self, chip_id):
         resp = self.xfer([0x0E, chip_id], 900, 3)
@@ -185,7 +209,7 @@ class SoftST25TB:
         frame = payload + crc_14b(payload)
         for _ in range(tries):
             self.cmd.hf14b_bitbang(frame, etu_q8=ETU_Q8, rx_mode=0, reset_field=False, keep_field=True,
-                                   **ST25TB_MOD)
+                                   **self.mod)
             time.sleep(0.01)  # EEPROM programming time (tW ~ 5 ms)
             if not verify:
                 return True
@@ -196,4 +220,4 @@ class SoftST25TB:
     def completion(self):
         frame = b"\x0f" + crc_14b(b"\x0f")
         self.cmd.hf14b_bitbang(frame, etu_q8=ETU_Q8, rx_mode=0, reset_field=False, keep_field=False,
-                               **ST25TB_MOD)
+                               **self.mod)

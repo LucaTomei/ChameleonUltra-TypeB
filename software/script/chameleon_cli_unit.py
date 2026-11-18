@@ -11855,7 +11855,7 @@ class HF14BST25TB(ReaderRequiredUnit):
             if chip_id is None:
                 print(color_string((CR, " - No ST25TB answer to INITIATE.")))
                 return
-            print(f" - Chip_ID: 0x{chip_id:02X}")
+            print(f" - Chip_ID: 0x{chip_id:02X}  (modulation {tag.mod_str()})")
             if not tag.select(chip_id):
                 print(color_string((CR, " - SELECT failed.")))
                 return
