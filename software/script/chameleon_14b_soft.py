@@ -221,3 +221,50 @@ class SoftST25TB:
         frame = b"\x0f" + crc_14b(b"\x0f")
         self.cmd.hf14b_bitbang(frame, etu_q8=ETU_Q8, rx_mode=0, reset_field=False, keep_field=False,
                                **self.mod)
+
+
+# Blocks whose writes are irreversible on ST25TB: OTP (0..4), count-down counters (5..6), system/lock (255)
+PROTECTED_BLOCKS = set(range(0, 7)) | {0xFF}
+
+
+def dump_to_blocks(dump: bytes):
+    """Split a raw dump (blocks 0..N-1, 4 bytes each, as stored on the tag) into a list of blocks."""
+    if len(dump) % 4:
+        raise ValueError(f"dump size {len(dump)} is not a multiple of 4")
+    return [bytes(dump[i:i + 4]) for i in range(0, len(dump), 4)]
+
+
+def read_blocks(tag, count, progress=None):
+    """Read blocks 0..count-1. Returns a list (None for blocks that could not be read)."""
+    out = []
+    for blk in range(count):
+        data = tag.read_block(blk)
+        out.append(data)
+        if progress:
+            progress(blk, data)
+    return out
+
+
+def diff_blocks(current, reference):
+    """[(block, current, reference)] for blocks that differ (unreadable blocks count as different)."""
+    return [(i, c, r) for i, (c, r) in enumerate(zip(current, reference)) if c != r]
+
+
+def restore_blocks(tag, reference, force=False, progress=None):
+    """
+    Write `reference` blocks that differ from the tag, verifying each write.
+    Protected blocks are skipped unless force=True. Returns (written, skipped, failed) block lists.
+    """
+    written, skipped, failed = [], [], []
+    for blk, ref in enumerate(reference):
+        cur = tag.read_block(blk)
+        if cur == ref:
+            continue
+        if blk in PROTECTED_BLOCKS and not force:
+            skipped.append(blk)
+            continue
+        ok = tag.write_block(blk, ref)
+        (written if ok else failed).append(blk)
+        if progress:
+            progress(blk, cur, ref, ok)
+    return written, skipped, failed

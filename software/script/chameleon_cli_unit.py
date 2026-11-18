@@ -11818,6 +11818,8 @@ class HF14BST25TB(ReaderRequiredUnit):
             "  hf 14b st25tb -b 128           # ST25TB04K: UID + 128 blocks + system block\n"
             "  hf 14b st25tb -b 128 -f d.bin  # also save blocks 0..127 to a file\n"
             "  hf 14b st25tb --wrbl 42 -d 11223344   # write block 42 and verify\n"
+            "  hf 14b st25tb --diff d.bin            # compare the tag with a dump\n"
+            "  hf 14b st25tb --restore d.bin         # write back the blocks that differ\n"
             "\n"
             "blocks 0..4 (OTP), 5..6 (count-down counters) and 255 (OTP lock bits) are\n"
             "irreversible: writing them requires --force\n"
@@ -11829,6 +11831,10 @@ class HF14BST25TB(ReaderRequiredUnit):
         parser.add_argument("-d", "--data", type=str, default=None, help="4 bytes to write, hex")
         parser.add_argument("--force", action="store_true",
                             help="allow writing OTP/counter/system blocks (0..6, 255): irreversible")
+        parser.add_argument("--diff", type=str, default=None, metavar="FILE",
+                            help="compare the tag with a dump file and list differing blocks")
+        parser.add_argument("--restore", type=str, default=None, metavar="FILE",
+                            help="write the blocks of a dump file that differ from the tag, with verification")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -11848,6 +11854,18 @@ class HF14BST25TB(ReaderRequiredUnit):
                 raise ArgsParserError("block must be 0..127 or 255")
             if (args.wrbl <= 6 or args.wrbl == 0xFF) and not args.force:
                 raise ArgsParserError(f"block {args.wrbl} is OTP/counter/system (irreversible): add --force")
+        reference = None
+        if args.diff or args.restore:
+            if args.diff and args.restore:
+                raise ArgsParserError("use either --diff or --restore")
+            path = args.diff or args.restore
+            try:
+                with open(path, "rb") as fh:
+                    reference = chameleon_14b_soft.dump_to_blocks(fh.read())
+            except (OSError, ValueError) as e:
+                raise ArgsParserError(f"cannot load dump '{path}': {e}")
+            if not 1 <= len(reference) <= 128:
+                raise ArgsParserError(f"dump has {len(reference)} blocks, expected 1..128")
 
         tag = chameleon_14b_soft.SoftST25TB(self.cmd)
         try:
@@ -11864,6 +11882,30 @@ class HF14BST25TB(ReaderRequiredUnit):
                 print(color_string((CR, " - GET_UID failed.")))
                 return
             print(f" - UID    : {color_string((CG, uid.hex().upper()))}")
+            if reference is not None and args.diff:
+                current = chameleon_14b_soft.read_blocks(tag, len(reference))
+                diffs = chameleon_14b_soft.diff_blocks(current, reference)
+                if not diffs:
+                    print(color_string((CG, f" - Tag matches the dump ({len(reference)} blocks)")))
+                for blk, cur, ref in diffs:
+                    cur_s = cur.hex(" ").upper() if cur else "unreadable "
+                    print(f"   {blk:3d}: tag {color_string((CY, cur_s))}  dump {ref.hex(' ').upper()}")
+                if diffs:
+                    print(color_string((CY, f" - {len(diffs)} block(s) differ")))
+                return
+            if reference is not None and args.restore:
+                def show(blk, cur, ref, ok):
+                    state = color_string((CG, "ok")) if ok else color_string((CR, "FAILED"))
+                    cur_s = cur.hex(" ").upper() if cur else "??"
+                    print(f"   {blk:3d}: {cur_s} -> {ref.hex(' ').upper()}  {state}")
+                written, skipped, failed = chameleon_14b_soft.restore_blocks(tag, reference, args.force, show)
+                print(f" - Restore: {len(written)} written, {len(failed)} failed, "
+                      f"{len(reference) - len(written) - len(failed) - len(skipped)} already identical")
+                if skipped:
+                    print(color_string((CY, f" - Skipped protected blocks {skipped} (use --force, irreversible)")))
+                if failed:
+                    print(color_string((CR, f" - Failed blocks: {failed}")))
+                return
             if write_data is not None:
                 before = tag.read_block(args.wrbl)
                 print(f" - Block {args.wrbl} before: {before.hex(' ').upper() if before else '?'}")
