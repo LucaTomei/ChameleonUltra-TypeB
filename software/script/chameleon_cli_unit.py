@@ -11816,6 +11816,7 @@ class HF14BST25TB(ReaderRequiredUnit):
             "examples:\n"
             "  hf 14b st25tb                          # Chip_ID + UID\n"
             "  hf 14b st25tb -b 128 -f d.bin          # ST25TB04K: read all blocks, save to file\n"
+            "  hf 14b st25tb -b 128 -f card.nfc       # same, as a Flipper Zero .nfc file\n"
             "  hf 14b st25tb --wrbl 42 -d 11223344    # write block 42 and verify\n"
             "  hf 14b st25tb --diff d.bin             # compare the tag with a dump file\n"
             "  hf 14b st25tb --restore d.bin          # write back the blocks that differ\n"
@@ -11828,7 +11829,8 @@ class HF14BST25TB(ReaderRequiredUnit):
         )
         parser.add_argument("-b", "--blocks", type=int, default=0,
                             help="number of blocks to read (ST25TB512: 16, 02K: 64, 04K: 128)")
-        parser.add_argument("-f", "--file", type=str, default=None, help="save read blocks to this binary file")
+        parser.add_argument("-f", "--file", type=str, default=None,
+                            help="save read blocks to a file (.nfc = Flipper Zero format, otherwise raw binary)")
         parser.add_argument("--wrbl", type=int, default=None, help="block to write (with -d)")
         parser.add_argument("-d", "--data", type=str, default=None, help="4 bytes to write, hex")
         parser.add_argument("--force", action="store_true",
@@ -11861,8 +11863,7 @@ class HF14BST25TB(ReaderRequiredUnit):
         path = args.diff or args.restore
         if path:
             try:
-                with open(path, "rb") as fh:
-                    blocks = soft.dump_to_blocks(fh.read())
+                blocks = soft.load_dump_file(path)["blocks"]
             except (OSError, ValueError) as e:
                 raise ArgsParserError(f"cannot load dump '{path}': {e}")
         elif args.diff_slot is not None or args.restore_slot is not None:
@@ -11975,9 +11976,12 @@ class HF14BST25TB(ReaderRequiredUnit):
             if failed:
                 print(color_string((CY, f" - {len(failed)} block(s) could not be read: {failed}")))
             if args.file:
-                with open(args.file, "wb") as fh:
-                    fh.write(b"".join(b if b else b"\x00" * 4 for b in blocks))
-                print(f" - Saved {n_blocks * 4} bytes to {args.file}")
+                try:
+                    soft.save_dump_file(args.file, uid, blocks, sys_block)
+                except ValueError as e:
+                    print(color_string((CR, f" - Not saved: {e}")))
+                else:
+                    print(f" - Saved {n_blocks} blocks to {args.file}")
             if save_idx is not None:
                 if failed:
                     print(color_string((CR, " - Not saved to the vault: some blocks could not be read")))
@@ -12068,9 +12072,9 @@ class HF14BVaultDelete(DeviceRequiredUnit):
 class HF14BVaultExport(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
         parser = ArgumentParserNoExit()
-        parser.description = "Export the blocks of a vault slot to a binary dump file"
+        parser.description = "Export a vault slot to a dump file (.nfc = Flipper Zero format, otherwise raw binary)"
         parser.add_argument("-s", "--slot", type=int, required=True, help="vault slot 1..8")
-        parser.add_argument("-f", "--file", type=str, required=True, help="output binary dump file")
+        parser.add_argument("-f", "--file", type=str, required=True, help="output dump file (.nfc or binary)")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -12082,8 +12086,10 @@ class HF14BVaultExport(DeviceRequiredUnit):
             print(f" - Slot {idx + 1} is empty")
             return
         rec = soft.vault_unpack(blob)
-        with open(args.file, "wb") as fh:
-            fh.write(b"".join(rec["blocks"]))
+        try:
+            soft.save_dump_file(args.file, rec["uid"], rec["blocks"], rec["sys"])
+        except ValueError as e:
+            raise ArgsParserError(str(e))
         print(f" - Exported {len(rec['blocks'])} blocks of slot {idx + 1} to {args.file}")
 
 
@@ -12091,10 +12097,11 @@ class HF14BVaultExport(DeviceRequiredUnit):
 class HF14BVaultImport(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
         parser = ArgumentParserNoExit()
-        parser.description = "Import a binary dump file into a vault slot"
+        parser.description = "Import a dump file (Flipper Zero .nfc or raw binary) into a vault slot"
         parser.add_argument("-s", "--slot", type=int, required=True, help="vault slot 1..8")
-        parser.add_argument("-f", "--file", type=str, required=True, help="binary dump file (blocks 0..N-1)")
-        parser.add_argument("--uid", type=str, default="", help="UID to record with the dump (hex, 8 bytes)")
+        parser.add_argument("-f", "--file", type=str, required=True, help="Flipper .nfc or binary dump (blocks 0..N-1)")
+        parser.add_argument("--uid", type=str, default="",
+                            help="UID to record with a binary dump (hex, 8 bytes; .nfc files carry their own)")
         parser.add_argument("--name", type=str, default="", help="name (max 32 bytes)")
         return parser
 
@@ -12103,14 +12110,14 @@ class HF14BVaultImport(DeviceRequiredUnit):
 
         idx = _vault_index(args.slot)
         try:
-            with open(args.file, "rb") as fh:
-                blocks = soft.dump_to_blocks(fh.read())
-            uid = bytes.fromhex(args.uid) if args.uid else b"\x00" * 8
+            dump = soft.load_dump_file(args.file)
+            blocks = dump["blocks"]
+            uid = bytes.fromhex(args.uid) if args.uid else (dump["uid"] or b"\x00" * 8)
         except (OSError, ValueError) as e:
             raise ArgsParserError(str(e))
         if not 1 <= len(blocks) <= 128 or len(uid) != 8 or len(args.name.encode("utf-8")) > 32:
             raise ArgsParserError("expected 1..128 blocks, an 8-byte UID and a name of at most 32 bytes")
-        blob = soft.vault_pack(uid, blocks, None, args.name)
+        blob = soft.vault_pack(uid, blocks, dump["sys"], args.name)
         self.cmd.hf14b_vault_save(idx, blob)
         if self.cmd.hf14b_vault_load(idx) != blob:
             print(color_string((CR, " - Verification failed")))

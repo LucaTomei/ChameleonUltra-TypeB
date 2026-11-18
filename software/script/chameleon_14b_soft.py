@@ -302,3 +302,78 @@ def vault_unpack(blob):
         "name": blob[20:52].rstrip(b"\x00").decode("utf-8", "replace"),
         "blocks": [blob[52 + i * 4:56 + i * 4] for i in range(count)],
     }
+
+
+# ---------------------------------------------------------------------------
+# Flipper Zero .nfc files (Device type: ST25TB), read and written as the
+# Flipper does, so dumps can be exchanged both ways.
+# ---------------------------------------------------------------------------
+_FLIPPER_TYPES_BY_BLOCKS = {128: "4K", 64: "2K"}
+
+
+def flipper_dump(uid, blocks, sys_block=None, st25tb_type=None):
+    """Return the text of a Flipper .nfc file for a ST25TB."""
+    if st25tb_type is None:
+        st25tb_type = _FLIPPER_TYPES_BY_BLOCKS.get(len(blocks))
+        if st25tb_type is None:
+            raise ValueError(f"unknown ST25TB type for {len(blocks)} blocks, pass st25tb_type")
+    lines = [
+        "Filetype: Flipper NFC device",
+        "Version: 4",
+        "# Device type can be ISO14443-3A, ISO14443-3B, ISO14443-4A, ISO14443-4B, ISO15693-3, FeliCa, "
+        "NTAG/Ultralight, Mifare Classic, Mifare Plus, Mifare DESFire, SLIX, ST25TB, NTAG4xx, Type 4 Tag, EMV",
+        "Device type: ST25TB",
+        "# UID is common for all formats",
+        f"UID: {bytes(uid).hex(' ').upper()}",
+        "# ST25TB specific data",
+        f"ST25TB Type: {st25tb_type}",
+    ]
+    lines += [f"Block {i}: {bytes(b).hex(' ').upper()}" for i, b in enumerate(blocks)]
+    sys_hex = bytes(sys_block or bytes([0xFF] * 4)).hex(" ").upper()
+    lines.append(f"System OTP Block: {sys_hex}")
+    return "\n".join(lines) + "\n"
+
+
+def flipper_parse(text):
+    """Parse a Flipper .nfc ST25TB file. Returns dict(uid, blocks, sys, type)."""
+    fields, blocks = {}, {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = (x.strip() for x in line.split(":", 1))
+        if key.startswith("Block "):
+            blocks[int(key[6:])] = bytes.fromhex(value)
+        else:
+            fields[key] = value
+    if fields.get("Filetype") != "Flipper NFC device" or fields.get("Device type") != "ST25TB":
+        raise ValueError("not a Flipper NFC ST25TB file")
+    if not blocks or sorted(blocks) != list(range(len(blocks))):
+        raise ValueError("missing or non contiguous blocks")
+    if any(len(b) != 4 for b in blocks.values()):
+        raise ValueError("blocks must be 4 bytes")
+    uid = bytes.fromhex(fields.get("UID", ""))
+    if len(uid) != 8:
+        raise ValueError("UID must be 8 bytes")
+    sys_block = bytes.fromhex(fields["System OTP Block"]) if "System OTP Block" in fields else None
+    return {"uid": uid, "blocks": [blocks[i] for i in range(len(blocks))], "sys": sys_block,
+            "type": fields.get("ST25TB Type")}
+
+
+def load_dump_file(path):
+    """Load a dump from a raw binary file or a Flipper .nfc file. Returns dict(uid, blocks, sys)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith(b"Filetype: Flipper NFC device"):
+        return flipper_parse(data.decode("utf-8"))
+    return {"uid": None, "blocks": dump_to_blocks(data), "sys": None}
+
+
+def save_dump_file(path, uid, blocks, sys_block=None):
+    """Save as Flipper .nfc when the path ends with .nfc, raw binary otherwise."""
+    if path.lower().endswith(".nfc"):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(flipper_dump(uid, blocks, sys_block))
+    else:
+        with open(path, "wb") as fh:
+            fh.write(b"".join(b if b else b"\x00" * 4 for b in blocks))
