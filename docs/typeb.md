@@ -83,6 +83,17 @@ hf 14b vault export -s 1 -f d.bin | import -s 2 -f d.bin --uid <hex> --name x
 
 The vault stores data only: a ST25TB cannot be emulated by the Ultra (see Limitations).
 
+Flipper Zero: any dump path ending in `.nfc` is read and written in the Flipper Zero format
+(`Device type: ST25TB`), byte for byte identical to the files the Flipper saves. This works with
+`-f`, `--diff`, `--restore` and `hf 14b vault import/export`:
+
+```
+hf 14b st25tb -b 128 -f card.nfc          # read the tag into a Flipper file
+hf 14b st25tb --restore card.nfc          # restore the tag from a Flipper file
+hf 14b vault import -s 2 -f card.nfc      # store a Flipper read in the device vault
+hf 14b vault export -s 1 -f card.nfc      # take a vault dump to the Flipper
+```
+
 Low-level experimental commands:
 
 | Command | ID | Purpose |
