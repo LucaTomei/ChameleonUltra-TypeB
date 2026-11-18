@@ -103,6 +103,8 @@ packages (`ultra-dfu-app.zip`, ...) and the CLI clients for Linux, macOS and Win
 - Reader only: emulating a Type B tag is not possible on this hardware. In card mode the Ultra uses
   the nRF52840 NFCT peripheral, which implements ISO14443-A framing in hardware and gives no access
   to the raw field, so it can neither decode the reader's 10% ASK nor produce a BPSK answer.
-- Modulation depth and receiver gain are tuned for a tag lying on the antenna; other distances
-  or tags may need different `CWGsPReg` values.
+- Modulation is searched automatically: if the tag does not answer INITIATE with the default
+  `CWGsPReg` `0x3F`/`0x09`, the client tries the other settings that produced valid answers
+  (`CWGsPReg`, `GsNReg`, one TX driver off) and keeps the working one for the session. Tested
+  15/15 with the tag offset by 1 cm, lifted a few millimetres and rotated by 90 degrees.
 - Slow: every exchange goes through USB and host-side demodulation.
