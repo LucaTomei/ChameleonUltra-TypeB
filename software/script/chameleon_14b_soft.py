@@ -15,6 +15,7 @@ HF14B_BITBANG firmware command:
 """
 import cmath
 import math
+import time
 
 US_PER_SAMPLE = 1.0025                      # measured SPIM byte period on nRF52840 @ 8 MHz
 ETU_SAMPLES = 128 / 13.56 / US_PER_SAMPLE   # ~9.42 samples per etu
@@ -168,6 +169,29 @@ class SoftST25TB:
 
     def read_block(self, block):
         return self.xfer([0x08, block], 1100, 6)
+
+    def write_block(self, block, data, verify=True, tries=3):
+        """
+        WRITE_BLOCK (0x09). The tag does not answer, so the result is checked by
+        reading the block back. Returns True when the block holds `data`.
+
+        Note: blocks 0..4 are OTP (bits can only go 1 -> 0), 5..6 are count-down
+        counters and 255 holds the OTP lock bits; writes there are irreversible.
+        """
+        data = bytes(data)
+        if len(data) != 4:
+            raise ValueError("ST25TB blocks are 4 bytes")
+        payload = bytes([0x09, block]) + data
+        frame = payload + crc_14b(payload)
+        for _ in range(tries):
+            self.cmd.hf14b_bitbang(frame, etu_q8=ETU_Q8, rx_mode=0, reset_field=False, keep_field=True,
+                                   **ST25TB_MOD)
+            time.sleep(0.01)  # EEPROM programming time (tW ~ 5 ms)
+            if not verify:
+                return True
+            if self.read_block(block) == data:
+                return True
+        return False
 
     def completion(self):
         frame = b"\x0f" + crc_14b(b"\x0f")

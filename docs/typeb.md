@@ -53,6 +53,15 @@ hf 14b st25tb -b 128 -f d.bin    # ST25TB04K: UID + blocks 0..127 + system block
 
 Use `-b 16` for ST25TB512 and `-b 64` for ST25TB02K. Expect about one second per block.
 
+Writing a block (the tag does not answer `WRITE_BLOCK`, so the block is read back to verify):
+
+```
+hf 14b st25tb --wrbl 42 -d 11223344
+```
+
+Blocks 0..4 (OTP, bits can only go 1 -> 0), 5..6 (count-down counters) and 255 (OTP lock bits)
+are irreversible and require `--force`.
+
 Low-level experimental commands:
 
 | Command | ID | Purpose |
@@ -84,9 +93,16 @@ nrfutil device program --firmware firmware/objects/ultra-dfu-app.zip --traits no
 
 Keep an official `ultra-dfu-app.zip` from the upstream releases around to roll back.
 
+## Releases
+
+Every firmware change is published as a GitHub release tagged `v2.3.0-typeb.N`, with the DFU
+packages (`ultra-dfu-app.zip`, ...) and the CLI clients for Linux, macOS and Windows attached.
+
 ## Limitations
 
-- Read only (no `WRITE_BLOCK` yet).
+- Reader only: emulating a Type B tag is not possible on this hardware. In card mode the Ultra uses
+  the nRF52840 NFCT peripheral, which implements ISO14443-A framing in hardware and gives no access
+  to the raw field, so it can neither decode the reader's 10% ASK nor produce a BPSK answer.
 - Modulation depth and receiver gain are tuned for a tag lying on the antenna; other distances
   or tags may need different `CWGsPReg` values.
 - Slow: every exchange goes through USB and host-side demodulation.

@@ -11817,14 +11817,37 @@ class HF14BST25TB(ReaderRequiredUnit):
             "  hf 14b st25tb                  # UID only\n"
             "  hf 14b st25tb -b 128           # ST25TB04K: UID + 128 blocks + system block\n"
             "  hf 14b st25tb -b 128 -f d.bin  # also save blocks 0..127 to a file\n"
+            "  hf 14b st25tb --wrbl 42 -d 11223344   # write block 42 and verify\n"
+            "\n"
+            "blocks 0..4 (OTP), 5..6 (count-down counters) and 255 (OTP lock bits) are\n"
+            "irreversible: writing them requires --force\n"
         )
         parser.add_argument("-b", "--blocks", type=int, default=0,
                             help="number of blocks to read (ST25TB512: 16, 02K: 64, 04K: 128)")
         parser.add_argument("-f", "--file", type=str, default=None, help="save read blocks to this binary file")
+        parser.add_argument("--wrbl", type=int, default=None, help="block to write (with -d)")
+        parser.add_argument("-d", "--data", type=str, default=None, help="4 bytes to write, hex")
+        parser.add_argument("--force", action="store_true",
+                            help="allow writing OTP/counter/system blocks (0..6, 255): irreversible")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
         import chameleon_14b_soft
+
+        write_data = None
+        if args.wrbl is not None or args.data is not None:
+            if args.wrbl is None or args.data is None:
+                raise ArgsParserError("--wrbl and -d must be used together")
+            try:
+                write_data = bytes.fromhex(args.data)
+            except ValueError:
+                raise ArgsParserError(f"bad hex data '{args.data}'")
+            if len(write_data) != 4:
+                raise ArgsParserError("ST25TB blocks are 4 bytes (8 hex digits)")
+            if not (0 <= args.wrbl <= 127 or args.wrbl == 0xFF):
+                raise ArgsParserError("block must be 0..127 or 255")
+            if (args.wrbl <= 6 or args.wrbl == 0xFF) and not args.force:
+                raise ArgsParserError(f"block {args.wrbl} is OTP/counter/system (irreversible): add --force")
 
         tag = chameleon_14b_soft.SoftST25TB(self.cmd)
         try:
@@ -11841,6 +11864,13 @@ class HF14BST25TB(ReaderRequiredUnit):
                 print(color_string((CR, " - GET_UID failed.")))
                 return
             print(f" - UID    : {color_string((CG, uid.hex().upper()))}")
+            if write_data is not None:
+                before = tag.read_block(args.wrbl)
+                print(f" - Block {args.wrbl} before: {before.hex(' ').upper() if before else '?'}")
+                if tag.write_block(args.wrbl, write_data):
+                    print(color_string((CG, f" - Block {args.wrbl} written and verified: {write_data.hex(' ').upper()}")))
+                else:
+                    print(color_string((CR, f" - Block {args.wrbl} write could not be verified")))
             if args.blocks <= 0:
                 return
             dump = bytearray()
