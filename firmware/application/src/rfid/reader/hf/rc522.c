@@ -1695,3 +1695,256 @@ void set_hf14a_config(const hf14a_config_t *hc) {
 hf14a_config_t *get_hf14a_config(void) {
     return &hf14aconfig;
 }
+
+/**
+ * @brief  Experimental raw transceive used by the ISO14443-B test command.
+ *
+ * Unlike pcd_14a_reader_bytes_transfer(), this never interprets the result:
+ * whatever ends up in the FIFO is returned together with the raw IRQ/error
+ * registers, so the host can judge what the RC522 front-end actually decoded.
+ * The caller is responsible for configuring the modulation/framing registers.
+ *
+ * @param pTx        bytes to send (sent as-is, no CRC is added here)
+ * @param szTx       number of bytes to send (<= DEF_FIFO_LENGTH)
+ * @param pRx        buffer for the received FIFO content
+ * @param pszRx      in: size of pRx, out: number of bytes copied
+ * @param timeout_ms how long to wait for RxIRq/IdleIRq
+ * @param pIrq       out: ComIrqReg after the exchange
+ * @param pErr       out: ErrorReg after the exchange
+ * @param pLastBits  out: RxLastBits (Control522Reg & 0x07)
+ * @retval STATUS_HF_TAG_OK if the receiver signalled an end of frame,
+ *         STATUS_HF_TAG_NO on timeout.
+ */
+uint8_t pcd_14b_test_transceive(uint8_t *pTx, uint8_t szTx, uint8_t *pRx, uint8_t *pszRx,
+                                uint16_t timeout_ms, uint8_t *pIrq, uint8_t *pErr, uint8_t *pLastBits) {
+    uint8_t irq = 0;
+    uint8_t not_timeout = 0;
+    uint8_t rx_max = *pszRx;
+
+    if (szTx > DEF_FIFO_LENGTH) {
+        szTx = DEF_FIFO_LENGTH;
+    }
+
+    write_register_single(CommandReg, PCD_IDLE);
+    write_register_single(ComIrqReg, 0x7F);         // clear all IRQ flags
+    set_register_mask(FIFOLevelReg, 0x80);          // flush FIFO
+    write_register_single(BitFramingReg, 0x00);     // whole bytes, no StartSend yet
+
+    write_register_buffer(FIFODataReg, pTx, szTx);
+    write_register_single(CommandReg, PCD_TRANSCEIVE);
+    set_register_mask(BitFramingReg, 0x80);         // StartSend
+
+    bsp_set_timer(g_timeout_auto_timer, 0);
+    do {
+        irq = read_register_single(ComIrqReg);
+        not_timeout = NO_TIMEOUT_1MS(g_timeout_auto_timer, timeout_ms);
+    } while (not_timeout && !(irq & 0x30));         // RxIRq | IdleIRq
+
+    clear_register_mask(BitFramingReg, 0x80);
+
+    *pIrq = read_register_single(ComIrqReg);
+    *pErr = read_register_single(ErrorReg);
+    *pLastBits = read_register_single(Control522Reg) & 0x07;
+
+    uint8_t n = read_register_single(FIFOLevelReg) & 0x7F;
+    if (n > rx_max) {
+        n = rx_max;
+    }
+    if (n > 0) {
+        read_register_buffer(FIFODataReg, pRx, n);
+    }
+    *pszRx = n;
+
+    write_register_single(CommandReg, PCD_IDLE);
+    return not_timeout ? STATUS_HF_TAG_OK : STATUS_HF_TAG_NO;
+}
+
+// ---------------------------------------------------------------------------
+// Experimental: software-generated ISO14443-B PCD->PICC frames.
+//
+// The RC522-family encoder only produces 14443A (Miller) framing. Here we leave
+// the encoder idle and modulate the carrier ourselves by rewriting a driver
+// conductance register (e.g. CWGsPReg) once per SPI byte. A single EasyDMA
+// burst writes the same register back-to-back (RC522 SPI writes every byte
+// after the address byte to that address), so the waveform timing does not
+// depend on CPU interrupts. SPI0 and SPIM0 share the same peripheral slot and
+// pin selection on nRF52840, so we temporarily flip ENABLE to SPIM, run the
+// burst, and restore the legacy SPI used by the rest of the driver.
+// ---------------------------------------------------------------------------
+
+#define HF14B_BB_BUF_SIZE 2100
+static uint8_t s_bb_tx[HF14B_BB_BUF_SIZE];
+static uint8_t s_bb_rx[HF14B_BB_BUF_SIZE];
+
+static uint32_t spim0_burst(const uint8_t *tx, uint8_t *rx, uint16_t len) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    NRF_SPI0->ENABLE = SPI_ENABLE_ENABLE_Disabled;
+    NRF_SPIM0->TXD.PTR = (uint32_t)tx;
+    NRF_SPIM0->TXD.MAXCNT = len;
+    NRF_SPIM0->RXD.PTR = (uint32_t)rx;
+    NRF_SPIM0->RXD.MAXCNT = (rx != NULL) ? len : 0;
+    NRF_SPIM0->ORC = 0x00;
+    NRF_SPIM0->EVENTS_END = 0;
+    NRF_SPIM0->ENABLE = SPIM_ENABLE_ENABLE_Enabled;
+
+    RC522_DOSEL;
+    uint32_t start = DWT->CYCCNT;
+    NRF_SPIM0->TASKS_START = 1;
+    while (NRF_SPIM0->EVENTS_END == 0);
+    uint32_t cycles = DWT->CYCCNT - start;
+    RC522_UNSEL;
+
+    NRF_SPIM0->EVENTS_END = 0;
+    NRF_SPIM0->EVENTS_ENDRX = 0;
+    NRF_SPIM0->EVENTS_ENDTX = 0;
+    NRF_SPIM0->EVENTS_STARTED = 0;
+    NRF_SPIM0->ENABLE = SPIM_ENABLE_ENABLE_Disabled;
+    NRF_SPI0->ENABLE = SPI_ENABLE_ENABLE_Enabled;
+    // The legacy SPI is double-buffered and event driven: make sure no stale
+    // READY event or RXD byte survives the SPIM burst, otherwise every later
+    // read_register_single() returns the previous transfer's byte.
+    NRF_SPI0->EVENTS_READY = 0;
+    (void)NRF_SPI0->RXD;
+    (void)NRF_SPI0->RXD;
+    NRF_SPI0->EVENTS_READY = 0;
+    return cycles;
+}
+
+typedef struct {
+    uint16_t pos;
+    uint32_t acc_q8;     // fractional byte accumulator (1/256 byte)
+    uint16_t etu_q8;     // SPI bytes per etu, 1/256 units
+    uint8_t hi;
+    uint8_t lo;
+    bool overflow;
+} bb_wave_t;
+
+static void bb_emit(bb_wave_t *w, bool level_hi, uint16_t etus) {
+    for (uint16_t e = 0; e < etus; e++) {
+        w->acc_q8 += w->etu_q8;
+        while (w->acc_q8 >= 256) {
+            w->acc_q8 -= 256;
+            if (w->pos >= HF14B_BB_BUF_SIZE) {
+                w->overflow = true;
+                return;
+            }
+            s_bb_tx[w->pos++] = level_hi ? w->hi : w->lo;
+        }
+    }
+}
+
+uint8_t pcd_14b_bb_burst_receive(const hf14b_bb_params_t *p, uint16_t len, hf14b_bb_result_t *res, uint8_t *samples);
+
+uint8_t pcd_14b_bitbang_transceive(const hf14b_bb_params_t *p, const uint8_t *frame, uint8_t frame_len,
+                                   hf14b_bb_result_t *res, uint8_t *samples) {
+    bb_wave_t w = { .pos = 0, .acc_q8 = 0, .etu_q8 = p->etu_q8, .hi = p->hi, .lo = p->lo, .overflow = false };
+
+    memset(res, 0, sizeof(*res));
+
+    // address byte: every following byte of the burst is written to mod_reg
+    s_bb_tx[w.pos++] = (uint8_t)((p->mod_reg << 1) & 0x7E);
+    bb_emit(&w, true, 1);                        // settle on unmodulated carrier
+    bb_emit(&w, false, p->sof_low);              // SOF: logic 0
+    bb_emit(&w, true, p->sof_high);              //      logic 1
+    for (uint8_t i = 0; i < frame_len; i++) {
+        bb_emit(&w, false, 1);                   // start bit
+        for (uint8_t b = 0; b < 8; b++) {        // LSB first, 1 = unmodulated
+            bb_emit(&w, (frame[i] >> b) & 1, 1);
+        }
+        bb_emit(&w, true, 1);                    // stop bit
+        bb_emit(&w, true, p->egt);               // extra guard time
+    }
+    bb_emit(&w, false, p->eof_low);              // EOF: logic 0
+    if (w.pos < HF14B_BB_BUF_SIZE) {
+        s_bb_tx[w.pos++] = p->hi;                // always end on full carrier
+    } else {
+        w.overflow = true;
+    }
+    if (w.overflow) {
+        write_register_single(p->mod_reg, p->hi);
+        return STATUS_PAR_ERR;
+    }
+    res->wave_len = w.pos;
+    return pcd_14b_bb_burst_receive(p, w.pos, res, samples);
+}
+
+/**
+ * Send s_bb_tx[0..len) (address byte + waveform) as one SPIM burst, then
+ * optionally run the RC522 receiver and sample p->sample_reg.
+ */
+uint8_t pcd_14b_bb_burst_receive(const hf14b_bb_params_t *p, uint16_t len, hf14b_bb_result_t *res, uint8_t *samples) {
+    if (p->rx_mode != 0) {
+        write_register_single(CommandReg, PCD_IDLE);
+        write_register_single(ComIrqReg, 0x7F);
+        set_register_mask(FIFOLevelReg, 0x80);
+    }
+
+    res->tx_cycles = spim0_burst(s_bb_tx, NULL, len);
+    write_register_single(p->mod_reg, p->hi);   // belt and braces
+    res->spi_check = read_register_single(VersionReg);
+
+    if (p->rx_mode == 0) {
+        return STATUS_HF_TAG_OK;
+    }
+
+    write_register_single(CommandReg, PCD_RECEIVE);
+
+    if (p->rx_mode == 2 && p->n_samples > 0) {
+        // Continuous read of sample_reg: each address byte clocks out the previous value.
+        uint16_t n = p->n_samples;
+        if (n > HF14B_BB_BUF_SIZE - 1) {
+            n = HF14B_BB_BUF_SIZE - 1;
+        }
+        uint8_t addr = (uint8_t)(((p->sample_reg << 1) & 0x7E) | 0x80);
+        memset(s_bb_tx, addr, n);
+        s_bb_tx[n] = 0x00;
+        res->rx_cycles = spim0_burst(s_bb_tx, s_bb_rx, n + 1);
+        memcpy(samples, &s_bb_rx[1], n);
+        res->n_samples = n;
+        res->spi_check2 = read_register_single(VersionReg);
+    }
+
+    uint8_t irq = 0;
+    uint8_t not_timeout;
+    bsp_set_timer(g_timeout_auto_timer, 0);
+    do {
+        irq = read_register_single(ComIrqReg);
+        not_timeout = NO_TIMEOUT_1MS(g_timeout_auto_timer, p->timeout_ms);
+    } while (not_timeout && !(irq & 0x22));      // RxIRq | ErrIRq
+
+    res->timeout = !not_timeout;
+    res->irq = read_register_single(ComIrqReg);
+    res->err = read_register_single(ErrorReg);
+    res->coll = read_register_single(CollReg);
+    res->status1 = read_register_single(Status1Reg);
+    res->last_bits = read_register_single(Control522Reg) & 0x07;
+    uint8_t fl = read_register_single(FIFOLevelReg) & 0x7F;
+    if (fl > sizeof(res->fifo)) {
+        fl = sizeof(res->fifo);
+    }
+    if (fl > 0) {
+        read_register_buffer(FIFODataReg, res->fifo, fl);
+    }
+    res->fifo_len = fl;
+    write_register_single(CommandReg, PCD_IDLE);
+    return STATUS_HF_TAG_OK;
+}
+
+/**
+ * Send a host-supplied waveform: one value of p->mod_reg per SPI byte (~1 us),
+ * then restore p->hi and optionally receive/sample as pcd_14b_bitbang_transceive().
+ */
+uint8_t pcd_14b_wave_transceive(const hf14b_bb_params_t *p, const uint8_t *wave, uint16_t wave_len,
+                                hf14b_bb_result_t *res, uint8_t *samples) {
+    memset(res, 0, sizeof(*res));
+    if (wave_len == 0 || wave_len > HF14B_BB_BUF_SIZE - 2) {
+        return STATUS_PAR_ERR;
+    }
+    s_bb_tx[0] = (uint8_t)((p->mod_reg << 1) & 0x7E);
+    memcpy(&s_bb_tx[1], wave, wave_len);
+    s_bb_tx[wave_len + 1] = p->hi;
+    res->wave_len = wave_len + 2;
+    return pcd_14b_bb_burst_receive(p, wave_len + 2, res, samples);
+}

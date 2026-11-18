@@ -90,6 +90,9 @@
 #define DATA_CMD_HF14A_GET_CONFIG               (2200)
 #define DATA_CMD_HF14A_SET_CONFIG               (2201)
 #define DATA_CMD_HF14A_SNIFF                    (2020)
+#define DATA_CMD_HF14B_RAW_TEST                 (2050)  /* experimental: raw RC522 register setup + transceive for ISO14443-B tests */
+#define DATA_CMD_HF14B_BITBANG                  (2051)  /* experimental: software-generated ISO14443-B frame via SPI burst modulation */
+#define DATA_CMD_HF14B_UNLOCK_SCAN              (2052)  /* experimental: on-device register pair sweep looking for hidden unlocks */
 
 //
 // ******************************************************************

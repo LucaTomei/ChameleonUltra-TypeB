@@ -3220,6 +3220,322 @@ static data_frame_tx_t *cmd_processor_hf14a_4_debug_counters(uint16_t cmd, uint1
     nfc_tag_14a_4_get_debug_counters(&buf[0], &buf[1], &buf[2], &buf[3]);
     return data_frame_make(cmd, STATUS_SUCCESS, 4, buf);
 }
+
+/**
+ * Registers the experimental 14B commands may write: config/test pages 0x11..0x3F,
+ * except TestPinEnReg/TestPinValueReg (0x33/0x34), which would enable output
+ * drivers on the D1..D7 pins shared with the SPI bus.
+ */
+static bool hf14b_reg_writable(uint8_t reg) {
+    return reg >= ModeReg && reg <= 0x3F && reg != TestPinEnReg && reg != TestPinValueReg;
+}
+
+/**
+ * Experimental ISO14443-B test command.
+ *
+ * Lets the host write RC522 configuration registers (0x11..0x2F only), read
+ * them back, and send raw frames, returning the raw FIFO/IRQ/error state.
+ * Registered with before_reader_run (no automatic reset), so a session can
+ * span several calls: flags decide when to reset and when to drop the field.
+ * Any later 14A command resets the RC522 back to its normal 14A setup.
+ *
+ * request:  u8 flags (bit0: reset reader + field on first, bit1: keep field on after)
+ *           u16 timeout_ms (BE)
+ *           u8 n_regs, n_regs * { u8 reg, u8 value }
+ *           u8 n_frames, n_frames * { u8 len, len bytes }
+ * response: u8 VersionReg
+ *           u8 n_regs, n_regs * { u8 reg, u8 readback }
+ *           u8 n_frames, n_frames * { u8 status, u8 ComIrqReg, u8 ErrorReg, u8 RxLastBits, u8 rx_len, rx_len bytes }
+ */
+#define HF14B_TEST_MAX_REGS     24
+#define HF14B_TEST_MAX_FRAMES   4
+#define HF14B_TEST_MAX_TX       32
+static data_frame_tx_t *cmd_processor_hf14b_raw_test(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[3 + HF14B_TEST_MAX_REGS * 2 + HF14B_TEST_MAX_FRAMES * (5 + DEF_FIFO_LENGTH)];
+    uint16_t in_pos = 0;
+    uint16_t out_len = 0;
+
+    if (length < 5) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t flags = data[in_pos++];
+    uint16_t timeout_ms = ((uint16_t)data[in_pos] << 8) | data[in_pos + 1];
+    in_pos += 2;
+    if (timeout_ms == 0 || timeout_ms > 1000) {
+        timeout_ms = DEF_COM_TIMEOUT;
+    }
+
+    // Validate the whole request before touching the hardware.
+    uint8_t n_regs = data[in_pos++];
+    uint16_t regs_pos = in_pos;
+    if (n_regs > HF14B_TEST_MAX_REGS || in_pos + n_regs * 2 + 1 > length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    for (uint8_t i = 0; i < n_regs; i++) {
+        uint8_t reg = data[regs_pos + i * 2];
+        // bit7 set = read-only entry (any register 0x00..0x3F), otherwise a write
+        if (!(reg & 0x80) && !hf14b_reg_writable(reg)) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+    }
+    in_pos += n_regs * 2;
+    uint8_t n_frames = data[in_pos++];
+    uint16_t frames_pos = in_pos;
+    if (n_frames > HF14B_TEST_MAX_FRAMES) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    for (uint8_t i = 0; i < n_frames; i++) {
+        if (in_pos >= length) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+        uint8_t len = data[in_pos++];
+        if (len == 0 || len > HF14B_TEST_MAX_TX || in_pos + len > length) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+        in_pos += len;
+    }
+
+    if (flags & 0x01) {
+        pcd_14a_reader_reset();
+        pcd_14a_reader_antenna_on();
+        bsp_delay_ms(8);
+    }
+
+    out[out_len++] = read_register_single(VersionReg);
+
+    out[out_len++] = n_regs;
+    for (uint8_t i = 0; i < n_regs; i++) {
+        uint8_t reg = data[regs_pos + i * 2];
+        if (!(reg & 0x80)) {
+            write_register_single(reg, data[regs_pos + i * 2 + 1]);
+        }
+    }
+    for (uint8_t i = 0; i < n_regs; i++) {
+        uint8_t reg = data[regs_pos + i * 2];
+        out[out_len++] = reg;
+        out[out_len++] = read_register_single(reg & 0x3F);
+    }
+
+    out[out_len++] = n_frames;
+    in_pos = frames_pos;
+    for (uint8_t i = 0; i < n_frames; i++) {
+        uint8_t len = data[in_pos++];
+        uint8_t irq = 0, err = 0, last_bits = 0;
+        uint8_t rx_len = DEF_FIFO_LENGTH;
+        uint16_t hdr = out_len;
+        out_len += 5;
+        uint8_t st = pcd_14b_test_transceive(&data[in_pos], len, &out[out_len], &rx_len,
+                                             timeout_ms, &irq, &err, &last_bits);
+        in_pos += len;
+        out[hdr] = st;
+        out[hdr + 1] = irq;
+        out[hdr + 2] = err;
+        out[hdr + 3] = last_bits;
+        out[hdr + 4] = rx_len;
+        out_len += rx_len;
+    }
+
+    if (!(flags & 0x02)) {
+        pcd_14a_reader_antenna_off();
+    }
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, out_len, out);
+}
+
+/**
+ * Experimental ISO14443-B bit-bang command: the PCD->PICC frame is generated in
+ * software by rewriting a driver conductance register once per SPI byte.
+ *
+ * request (BE): u8 flags (bit0 reset+field on, bit1 keep field)
+ *               u8 mod_reg, u8 hi, u8 lo, u16 etu_q8,
+ *               u8 sof_low, u8 sof_high, u8 eof_low, u8 egt,
+ *               u8 rx_mode, u16 timeout_ms, u16 n_samples, u8 sample_reg,
+ *               u8 n_regs, n_regs * { u8 reg, u8 value }   (see hf14b_reg_writable)
+ *               u8 frame_len, frame (CRC already appended, <= 16 bytes)
+ * response (BE): u16 wave_len, u32 tx_cycles, u32 rx_cycles,
+ *               u8 timeout, u8 irq, u8 err, u8 coll, u8 status1, u8 last_bits,
+ *               u8 fifo_len, fifo, u16 n_samples, samples
+ */
+static uint8_t s_hf14b_bb_samples[2048];
+static uint8_t s_hf14b_bb_out[32 + 64 + 2048];
+static data_frame_tx_t *cmd_processor_hf14b_bitbang(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    hf14b_bb_params_t p;
+    hf14b_bb_result_t res;
+    uint16_t pos = 0;
+
+    if (length < 18) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t flags = data[pos++];
+    p.mod_reg = data[pos++];
+    p.hi = data[pos++];
+    p.lo = data[pos++];
+    p.etu_q8 = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.sof_low = data[pos++];
+    p.sof_high = data[pos++];
+    p.eof_low = data[pos++];
+    p.egt = data[pos++];
+    p.rx_mode = data[pos++];
+    p.timeout_ms = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.n_samples = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.sample_reg = data[pos++] & 0x3F;
+
+    if (p.mod_reg < ModeReg || p.mod_reg > TCounterValueRegL || p.etu_q8 < 256 || p.rx_mode > 2 ||
+            p.sof_low > 32 || p.sof_high > 32 || p.eof_low > 32 || p.egt > 32 ||
+            p.n_samples > sizeof(s_hf14b_bb_samples)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (p.timeout_ms == 0 || p.timeout_ms > 1000) {
+        p.timeout_ms = DEF_COM_TIMEOUT;
+    }
+
+    uint8_t n_regs = data[pos++];
+    uint16_t regs_pos = pos;
+    if (n_regs > 24 || pos + n_regs * 2 + 1 > length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    for (uint8_t i = 0; i < n_regs; i++) {
+        uint8_t reg = data[regs_pos + i * 2];
+        if (!hf14b_reg_writable(reg)) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+    }
+    pos += n_regs * 2;
+    bool raw_wave = (flags & 0x04) != 0;
+    uint16_t frame_len;
+    if (raw_wave) {
+        // flags bit2: host-supplied waveform, u16 length + one mod_reg value per SPI byte
+        if (pos + 2 > length) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+        frame_len = ((uint16_t)data[pos] << 8) | data[pos + 1];
+        pos += 2;
+        if (frame_len == 0 || frame_len > 2048 || pos + frame_len > length) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+    } else {
+        frame_len = data[pos++];
+        if (frame_len == 0 || frame_len > 16 || pos + frame_len > length) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+    }
+
+    if (flags & 0x01) {
+        pcd_14a_reader_reset();
+        pcd_14a_reader_antenna_on();
+        bsp_delay_ms(8);
+    }
+    for (uint8_t i = 0; i < n_regs; i++) {
+        write_register_single(data[regs_pos + i * 2], data[regs_pos + i * 2 + 1]);
+    }
+
+    if (raw_wave) {
+        status = pcd_14b_wave_transceive(&p, &data[pos], frame_len, &res, s_hf14b_bb_samples);
+    } else {
+        status = pcd_14b_bitbang_transceive(&p, &data[pos], (uint8_t)frame_len, &res, s_hf14b_bb_samples);
+    }
+
+    if (!(flags & 0x02)) {
+        pcd_14a_reader_antenna_off();
+    }
+    if (status != STATUS_HF_TAG_OK) {
+        return data_frame_make(cmd, status, 0, NULL);
+    }
+
+    uint8_t *o = s_hf14b_bb_out;
+    uint16_t n = 0;
+    o[n++] = res.wave_len >> 8;
+    o[n++] = res.wave_len & 0xFF;
+    for (int8_t sh = 24; sh >= 0; sh -= 8) o[n++] = (res.tx_cycles >> sh) & 0xFF;
+    for (int8_t sh = 24; sh >= 0; sh -= 8) o[n++] = (res.rx_cycles >> sh) & 0xFF;
+    o[n++] = res.timeout;
+    o[n++] = res.irq;
+    o[n++] = res.err;
+    o[n++] = res.coll;
+    o[n++] = res.status1;
+    o[n++] = res.last_bits;
+    o[n++] = res.fifo_len;
+    memcpy(&o[n], res.fifo, res.fifo_len);
+    n += res.fifo_len;
+    o[n++] = res.n_samples >> 8;
+    o[n++] = res.n_samples & 0xFF;
+    memcpy(&o[n], s_hf14b_bb_samples, res.n_samples);
+    n += res.n_samples;
+    o[n++] = res.spi_check;
+    o[n++] = res.spi_check2;
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, n, o);
+}
+
+/**
+ * Experimental: on-device sweep looking for register values that "unlock" bits
+ * of a target register (e.g. TxModeReg framing bits). For every value a of regA
+ * (and every value b of regB, unless regB == 0xFF) it writes regA=a, regB=b,
+ * target=value, reads target back and records a hit when (readback ^ value) & mask == 0.
+ * The RC522 is soft-reset before and after the sweep; the RF field stays off.
+ *
+ * request:  u8 regA, u8 regB (0xFF = none), u8 target, u8 value, u8 mask, u8 max_hits,
+ *           u8 n_pre, n_pre * { u8 reg, u8 value }  (written once before the sweep)
+ * response: u32 iterations (BE), u8 n_hits, n_hits * { u8 a, u8 b, u8 readback }
+ */
+static data_frame_tx_t *cmd_processor_hf14b_unlock_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    static uint8_t out[5 + 64 * 3];
+    if (length < 7) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t reg_a = data[0], reg_b = data[1], target = data[2], value = data[3], mask = data[4];
+    uint8_t max_hits = data[5], n_pre = data[6];
+    if (max_hits > 64) {
+        max_hits = 64;
+    }
+    if (!hf14b_reg_writable(reg_a) || (reg_b != 0xFF && !hf14b_reg_writable(reg_b)) ||
+            !hf14b_reg_writable(target) || 7 + n_pre * 2 > length || n_pre > 24) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    for (uint8_t i = 0; i < n_pre; i++) {
+        if (!hf14b_reg_writable(data[7 + i * 2])) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+    }
+
+    pcd_14a_reader_reset();  // soft reset: all registers back to defaults, field off
+    for (uint8_t i = 0; i < n_pre; i++) {
+        write_register_single(data[7 + i * 2], data[8 + i * 2]);
+    }
+
+    uint32_t iterations = 0;
+    uint8_t n_hits = 0;
+    uint16_t b_count = (reg_b == 0xFF) ? 1 : 256;
+    for (uint16_t a = 0; a < 256; a++) {
+        for (uint16_t b = 0; b < b_count; b++) {
+            write_register_single(reg_a, (uint8_t)a);
+            if (reg_b != 0xFF) {
+                write_register_single(reg_b, (uint8_t)b);
+            }
+            write_register_single(target, value);
+            uint8_t rb = read_register_single(target);
+            iterations++;
+            if ((((rb ^ value) & mask) == 0) && n_hits < max_hits) {
+                out[5 + n_hits * 3] = (uint8_t)a;
+                out[6 + n_hits * 3] = (uint8_t)b;
+                out[7 + n_hits * 3] = rb;
+                n_hits++;
+            }
+            if ((iterations & 0xFF) == 0) {
+                bsp_wdt_feed();
+            }
+        }
+    }
+
+    pcd_14a_reader_reset();
+    out[0] = (iterations >> 24) & 0xFF;
+    out[1] = (iterations >> 16) & 0xFF;
+    out[2] = (iterations >> 8) & 0xFF;
+    out[3] = iterations & 0xFF;
+    out[4] = n_hits;
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, 5 + n_hits * 3, out);
+}
 #endif
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
@@ -3397,6 +3713,10 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    6010,                                     NULL,                        cmd_processor_hf14a_4_debug_counters,        NULL                   },
     /* HF14A scan keeping field alive */
     {    DATA_CMD_HF14A_SCAN_KEEP,                before_hf_reader_run,        cmd_processor_hf14a_scan_keep,               NULL                   },
+    /* experimental ISO14443-B test: no automatic reset, field handled by request flags */
+    {    DATA_CMD_HF14B_RAW_TEST,                 before_reader_run,           cmd_processor_hf14b_raw_test,                NULL                   },
+    {    DATA_CMD_HF14B_BITBANG,                  before_reader_run,           cmd_processor_hf14b_bitbang,                 NULL                   },
+    {    DATA_CMD_HF14B_UNLOCK_SCAN,              before_reader_run,           cmd_processor_hf14b_unlock_scan,             NULL                   },
 #endif
 };
 data_frame_tx_t *cmd_processor_get_device_capabilities(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {

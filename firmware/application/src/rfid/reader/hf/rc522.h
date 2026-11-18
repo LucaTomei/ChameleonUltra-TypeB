@@ -266,6 +266,46 @@ void pcd_14a_reader_crc_computer(uint8_t use522CalcCRC);
 uint8_t cascade_to_cmd(uint8_t cascade);
 uint32_t get_u32_tag_uid(picc_14a_tag_t *tag);
 uint8_t *get_4byte_tag_uid(picc_14a_tag_t *tag, uint8_t *out);
+
+// Experimental ISO14443-B test support
+typedef struct {
+    uint8_t mod_reg;      // register rewritten every SPI byte (e.g. CWGsPReg)
+    uint8_t hi;           // value for unmodulated carrier (logic 1)
+    uint8_t lo;           // value for modulated carrier (logic 0)
+    uint16_t etu_q8;      // SPI bytes per etu, in 1/256 units
+    uint8_t sof_low;      // etu
+    uint8_t sof_high;     // etu
+    uint8_t eof_low;      // etu
+    uint8_t egt;          // etu between characters
+    uint8_t rx_mode;      // 0: TX only, 1: TX + RC522 receive, 2: + TestADCReg capture
+    uint16_t timeout_ms;  // receive wait
+    uint16_t n_samples;   // samples for rx_mode 2
+    uint8_t sample_reg;   // register sampled in rx_mode 2 (e.g. TestADCReg, TestBusReg)
+} hf14b_bb_params_t;
+
+typedef struct {
+    uint16_t wave_len;
+    uint32_t tx_cycles;   // 64 MHz CPU cycles spent in the TX burst
+    uint32_t rx_cycles;   // 64 MHz CPU cycles spent in the ADC capture burst
+    uint8_t timeout;
+    uint8_t irq;
+    uint8_t err;
+    uint8_t coll;
+    uint8_t status1;
+    uint8_t last_bits;
+    uint8_t fifo_len;
+    uint8_t fifo[64];
+    uint16_t n_samples;
+    uint8_t spi_check;    // VersionReg read right after the TX burst
+    uint8_t spi_check2;   // VersionReg read right after the sample burst
+} hf14b_bb_result_t;
+
+uint8_t pcd_14b_wave_transceive(const hf14b_bb_params_t *p, const uint8_t *wave, uint16_t wave_len,
+                                hf14b_bb_result_t *res, uint8_t *samples);
+uint8_t pcd_14b_bitbang_transceive(const hf14b_bb_params_t *p, const uint8_t *frame, uint8_t frame_len,
+                                   hf14b_bb_result_t *res, uint8_t *samples);
+uint8_t pcd_14b_test_transceive(uint8_t *pTx, uint8_t szTx, uint8_t *pRx, uint8_t *pszRx,
+                                uint16_t timeout_ms, uint8_t *pIrq, uint8_t *pErr, uint8_t *pLastBits);
 #ifdef __cplusplus
 }
 #endif

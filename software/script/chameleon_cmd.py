@@ -3,7 +3,7 @@ import ctypes
 from typing import Union
 
 import chameleon_com
-from chameleon_utils import expect_response, reconstruct_full_nt, parity_to_str
+from chameleon_utils import expect_response, reconstruct_full_nt, parity_to_str, UnexpectedResponseError
 from chameleon_enum import Command, SlotNumber, Status, TagSenseType, TagSpecificType
 from chameleon_enum import ButtonPressFunction, ButtonType, MifareClassicDarksideStatus
 from chameleon_enum import MfcKeyType, MfcValueBlockOperator
@@ -452,6 +452,112 @@ class ChameleonCMD:
             Command.HF14A_RAW, data, timeout=(resp_timeout_ms // 1000) + 1
         )
         return resp.data
+
+    def hf14b_raw_test(self, frames, regs=(), reset_field=True, keep_field=False, timeout_ms=20):
+        """
+        Experimental ISO14443-B test: write RC522 registers, read them back and
+        send raw frames (sent as-is, CRC must already be appended).
+
+        :param frames: list of bytes-like frames to send in sequence
+        :param regs: list of (reg, value) written before the frames (0x11..0x2F)
+        :param reset_field: reset the reader and switch the field on first
+        :param keep_field: leave the field on afterwards (to continue the session)
+        :param timeout_ms: per-frame response timeout
+        :return: dict with version, regs readback and per-frame results
+        """
+        flags = (0x01 if reset_field else 0) | (0x02 if keep_field else 0)
+        data = struct.pack("!BHB", flags, timeout_ms, len(regs))
+        for reg, val in regs:
+            data += struct.pack("!BB", reg, val)
+        data += struct.pack("!B", len(frames))
+        for frame in frames:
+            data += struct.pack("!B", len(frame)) + bytes(frame)
+        resp = self.device.send_cmd_sync(Command.HF14B_RAW_TEST, data, timeout=3)
+        if resp.status != Status.HF_TAG_OK:
+            raise UnexpectedResponseError(f"HF14B_RAW_TEST failed, status={resp.status}")
+        d = resp.data
+        pos = 0
+        result = {"version": d[pos], "regs": [], "frames": []}
+        pos += 1
+        n_regs = d[pos]
+        pos += 1
+        for _ in range(n_regs):
+            result["regs"].append((d[pos], d[pos + 1]))
+            pos += 2
+        n_frames = d[pos]
+        pos += 1
+        for _ in range(n_frames):
+            st, irq, err, last_bits, rx_len = d[pos:pos + 5]
+            pos += 5
+            result["frames"].append({
+                "timeout": st != Status.HF_TAG_OK,
+                "irq": irq,
+                "err": err,
+                "last_bits": last_bits,
+                "rx": bytes(d[pos:pos + rx_len]),
+            })
+            pos += rx_len
+        return result
+
+    def hf14b_bitbang(self, frame, mod_reg=0x28, hi=0x3F, lo=0x30, etu_q8=2417,
+                      sof_low=10, sof_high=2, eof_low=10, egt=0, rx_mode=1,
+                      timeout_ms=5, n_samples=0, regs=(), reset_field=True, keep_field=False,
+                      sample_reg=0x3B, wave=None):
+        """
+        Experimental: send a software-generated ISO14443-B frame (CRC already appended)
+        by rewriting mod_reg once per SPI byte, then optionally listen with the RC522.
+
+        :param etu_q8: SPI bytes per etu in 1/256 units (9.44 bytes/etu at exactly 1 us/byte)
+        :param rx_mode: 0 TX only, 1 TX + receive, 2 TX + receive + TestADCReg capture
+        :return: dict with timing, receiver registers, FIFO and ADC samples
+        """
+        flags = (0x01 if reset_field else 0) | (0x02 if keep_field else 0) | (0x04 if wave is not None else 0)
+        data = struct.pack("!BBBBHBBBBBHHBB", flags, mod_reg, hi, lo, etu_q8,
+                           sof_low, sof_high, eof_low, egt, rx_mode, timeout_ms, n_samples, sample_reg,
+                           len(regs))
+        for reg, val in regs:
+            data += struct.pack("!BB", reg, val)
+        if wave is not None:
+            data += struct.pack("!H", len(wave)) + bytes(wave)
+        else:
+            data += struct.pack("!B", len(frame)) + bytes(frame)
+        resp = self.device.send_cmd_sync(Command.HF14B_BITBANG, data, timeout=3)
+        if resp.status != Status.HF_TAG_OK:
+            raise UnexpectedResponseError(f"HF14B_BITBANG failed, status={resp.status}")
+        d = resp.data
+        wave_len, tx_cycles, rx_cycles = struct.unpack("!HII", d[0:10])
+        timeout, irq, err, coll, status1, last_bits, fifo_len = d[10:17]
+        pos = 17
+        fifo = bytes(d[pos:pos + fifo_len])
+        pos += fifo_len
+        (n,) = struct.unpack("!H", d[pos:pos + 2])
+        pos += 2
+        return {
+            "wave_len": wave_len, "tx_us": tx_cycles / 64.0, "rx_us": rx_cycles / 64.0,
+            "timeout": bool(timeout), "irq": irq, "err": err, "coll": coll,
+            "status1": status1, "last_bits": last_bits, "fifo": fifo,
+            "samples": bytes(d[pos:pos + n]),
+            "spi_check": tuple(d[pos + n:pos + n + 2]),
+        }
+
+    def hf14b_unlock_scan(self, reg_a, reg_b=None, target=0x12, value=0x03, mask=0x03, max_hits=64, pre=()):
+        """
+        Experimental: on-device sweep of reg_a (and reg_b) values, looking for
+        settings that make `mask` bits of `target` accept `value`.
+
+        :return: (iterations, [(a, b, readback), ...])
+        """
+        data = struct.pack("!BBBBBBB", reg_a, 0xFF if reg_b is None else reg_b, target, value, mask,
+                           max_hits, len(pre))
+        for reg, val in pre:
+            data += struct.pack("!BB", reg, val)
+        resp = self.device.send_cmd_sync(Command.HF14B_UNLOCK_SCAN, data, timeout=10)
+        if resp.status != Status.HF_TAG_OK:
+            raise UnexpectedResponseError(f"HF14B_UNLOCK_SCAN failed, status={resp.status}")
+        d = resp.data
+        (iterations,) = struct.unpack("!I", d[0:4])
+        hits = [tuple(d[5 + i * 3:8 + i * 3]) for i in range(d[4])]
+        return iterations, hits
 
     @expect_response(Status.HF_TAG_OK)
     def mf1_manipulate_value_block(

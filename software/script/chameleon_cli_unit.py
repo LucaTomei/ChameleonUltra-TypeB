@@ -928,6 +928,7 @@ hw_settings = hw.subgroup("settings", "Chameleon settings commands")
 
 hf = root.subgroup("hf", "High Frequency commands")
 hf_14a = hf.subgroup("14a", "ISO14443-a commands")
+hf_14b = hf.subgroup("14b", "ISO14443-b commands (experimental)")
 hf_mf = hf.subgroup("mf", "MIFARE Classic commands")
 hf_mfu = hf.subgroup("mfu", "MIFARE Ultralight / NTAG commands")
 hf_des = hf.subgroup("des", "MIFARE DESFire commands")
@@ -11626,3 +11627,240 @@ class HFSeosKeys(SlotIndexArgsAndGoUnit, DeviceRequiredUnit):
             return
 
         self.cmd.seos_write_emu_keys(auth=auth, privenc=privenc, privmac=privmac)
+
+
+# ---------------------------------------------------------------------------
+# Experimental ISO14443-B support (RC522 register tweaking)
+# ---------------------------------------------------------------------------
+
+
+def crc_14b(data) -> bytes:
+    """CRC_B (ISO/IEC 13239, CRC-16/X-25), returned LSB first as sent on air."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    crc = ~crc & 0xFFFF
+    return bytes([crc & 0xFF, crc >> 8])
+
+
+# Starting point for Type B on an RC522-family front-end: ASK 10% instead of
+# forced 100% ASK, TX/RX framing bits set to "ISO14443B" (only meaningful on
+# RC523/PN512-class silicon, reserved on MFRC522), CRC handled in software.
+HF14B_PRESET_REGS = [
+    (0x15, 0x00),  # TxASKReg (TxAutoReg): Force100ASK off
+    (0x12, 0x03),  # TxModeReg: 106 kbit/s, TxFraming=11 (14443B), no HW CRC
+    (0x13, 0x03),  # RxModeReg: 106 kbit/s, RxFraming=11 (14443B), no HW CRC
+    (0x27, 0xF4),  # GsNReg: CWGsN=F, ModGsN=4
+    (0x28, 0x3F),  # CWGsPReg: max conductance when not modulating
+    (0x29, 0x11),  # ModGsPReg: conductance while modulating (sets ASK depth)
+    (0x18, 0x55),  # RxThresholdReg
+]
+
+HF14B_REG_NAMES = {
+    0x11: "ModeReg", 0x12: "TxModeReg", 0x13: "RxModeReg", 0x14: "TxControlReg",
+    0x15: "TxASKReg", 0x16: "TxSelReg", 0x17: "RxSelReg", 0x18: "RxThresholdReg",
+    0x19: "DemodReg", 0x1C: "MfTxReg", 0x1D: "MfRxReg", 0x24: "ModWidthReg",
+    0x26: "RFCfgReg", 0x27: "GsNReg", 0x28: "CWGsPReg", 0x29: "ModGsPReg",
+}
+
+COM_IRQ_BITS = ["TimerIRq", "ErrIRq", "LoAlertIRq", "HiAlertIRq", "IdleIRq", "RxIRq", "TxIRq", "Set1"]
+ERROR_BITS = ["ProtocolErr", "ParityErr", "CRCErr", "CollErr", "BufferOvfl", "rfu", "TempErr", "WrErr"]
+
+
+def _bits_str(value, names):
+    flags = [names[i] for i in range(8) if value & (1 << i)]
+    return ",".join(flags) if flags else "-"
+
+
+@hf_14b.command("test")
+class HF14BTest(ReaderRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.formatter_class = argparse.RawDescriptionHelpFormatter
+        parser.description = "EXPERIMENTAL: try ISO14443-B exchanges by reconfiguring the RC522"
+        parser.epilog = (
+            "examples:\n"
+            "  hf 14b test --st25tb                 # INITIATE / SELECT / GET_UID on a ST25TB/SRIX\n"
+            "  hf 14b test -d 0600                  # send INITIATE (CRC_B appended)\n"
+            "  hf 14b test --st25tb -r 0x29=0x08    # override ModGsPReg (deeper modulation)\n"
+            "  hf 14b test --no-preset -d 0600      # same frame with stock 14A register setup\n"
+        )
+        parser.add_argument("-d", "--data", type=str, action="append", default=[],
+                            help="hex frame to send, may be repeated (max 4)")
+        parser.add_argument("--st25tb", action="store_true",
+                            help="run ST25TB INITIATE -> SELECT -> GET_UID sequence")
+        parser.add_argument("--blocks", type=int, default=0,
+                            help="with --st25tb: also read the first N blocks")
+        parser.add_argument("-r", "--reg", type=str, action="append", default=[],
+                            help="register override REG=VAL (hex), applied after the preset")
+        parser.add_argument("--no-preset", action="store_true",
+                            help="do not apply the Type B register preset")
+        parser.add_argument("--no-crc", action="store_true",
+                            help="do not append CRC_B to -d frames")
+        parser.add_argument("-t", "--timeout", type=int, default=20,
+                            help="per-frame response timeout in ms (default 20)")
+        return parser
+
+    def _regs(self, args):
+        regs = [] if args.no_preset else list(HF14B_PRESET_REGS)
+        for item in args.reg:
+            try:
+                reg_s, val_s = item.split("=", 1)
+                reg, val = int(reg_s, 16), int(val_s, 16)
+            except ValueError:
+                raise ArgsParserError(f"bad register override '{item}', expected REG=VAL in hex")
+            if not (0x11 <= reg <= 0x3F) or reg in (0x33, 0x34) or not (0 <= val <= 0xFF):
+                raise ArgsParserError(f"register override '{item}' out of range (reg 0x11..0x3F, not 0x33/0x34)")
+            regs = [(r, v) for r, v in regs if r != reg] + [(reg, val)]
+        return regs
+
+    def _print_header(self, res, regs):
+        print(f" - VersionReg: 0x{res['version']:02X}")
+        requested = dict(regs)
+        for reg, readback in res["regs"]:
+            name = HF14B_REG_NAMES.get(reg, f"Reg{reg:02X}")
+            wanted = requested.get(reg)
+            mark = color_string((CG, "ok")) if readback == wanted else color_string((CR, f"wrote 0x{wanted:02X}"))
+            print(f"   {name:<15} 0x{reg:02X} = 0x{readback:02X}  {mark}")
+
+    def _print_frame(self, label, tx, fr):
+        print(f" - {label}  TX: {tx.hex(' ').upper()}")
+        if fr["timeout"]:
+            print(f"     RX: {color_string((CY, 'timeout'))}  irq={_bits_str(fr['irq'], COM_IRQ_BITS)}"
+                  f" err={_bits_str(fr['err'], ERROR_BITS)}")
+            return None
+        rx = fr["rx"]
+        crc_info = ""
+        if len(rx) >= 3:
+            crc_ok = crc_14b(rx[:-2]) == rx[-2:]
+            crc_info = color_string((CG, " CRC_B ok")) if crc_ok else color_string((CR, " CRC_B bad"))
+        rx_hex = rx.hex(" ").upper() if rx else "(empty)"
+        print(f"     RX: {rx_hex}{crc_info}  lastbits={fr['last_bits']}"
+              f" irq={_bits_str(fr['irq'], COM_IRQ_BITS)} err={_bits_str(fr['err'], ERROR_BITS)}")
+        return rx
+
+    def _exchange(self, frames, regs, reset, keep, timeout):
+        return self.cmd.hf14b_raw_test(frames, regs=regs, reset_field=reset, keep_field=keep, timeout_ms=timeout)
+
+    def on_exec(self, args: argparse.Namespace):
+        regs = self._regs(args)
+
+        if args.st25tb:
+            # 1) INITIATE: power-on field, tag answers with a random 1-byte Chip_ID
+            initiate = bytes([0x06, 0x00])
+            initiate += crc_14b(initiate)
+            res = self._exchange([initiate], regs, True, True, args.timeout)
+            self._print_header(res, regs)
+            rx = self._print_frame("INITIATE", initiate, res["frames"][0])
+            if not rx or len(rx) < 3 or crc_14b(rx[:-2]) != rx[-2:]:
+                self._exchange([], [], False, False, args.timeout)  # drop field
+                print(color_string((CR, " - No valid Type B answer to INITIATE.")))
+                return
+            chip_id = rx[0]
+            print(color_string((CG, f" - Chip_ID: 0x{chip_id:02X}")))
+            # 2) SELECT + GET_UID in the same RF session (registers kept, no reset)
+            select = bytes([0x0E, chip_id])
+            select += crc_14b(select)
+            get_uid = bytes([0x0B])
+            get_uid += crc_14b(get_uid)
+            keep = args.blocks > 0
+            res = self._exchange([select, get_uid], [], False, keep, args.timeout)
+            self._print_frame("SELECT  ", select, res["frames"][0])
+            rx = self._print_frame("GET_UID ", get_uid, res["frames"][1])
+            if rx and len(rx) == 10 and crc_14b(rx[:8]) == rx[8:]:
+                print(color_string((CG, f" - UID: {rx[:8][::-1].hex().upper()}")))
+            # 3) optional block reads, 4 per call to stay within the firmware limit
+            for start in range(0, args.blocks, 4):
+                blocks = list(range(start, min(start + 4, args.blocks)))
+                frames = []
+                for blk in blocks:
+                    f = bytes([0x08, blk])
+                    frames.append(f + crc_14b(f))
+                last = start + 4 >= args.blocks
+                res = self._exchange(frames, [], False, not last, args.timeout)
+                for blk, f, fr in zip(blocks, frames, res["frames"]):
+                    rx = self._print_frame(f"READ {blk:3d}", f, fr)
+                    if rx and len(rx) == 6 and crc_14b(rx[:4]) == rx[4:]:
+                        print(f"     block {blk:3d}: {rx[:4].hex(' ').upper()}")
+            return
+
+        if not args.data:
+            raise ArgsParserError("nothing to send: use -d HEX or --st25tb")
+        if len(args.data) > 4:
+            raise ArgsParserError("at most 4 frames per call")
+        frames = []
+        for h in args.data:
+            try:
+                f = bytes.fromhex(h)
+            except ValueError:
+                raise ArgsParserError(f"bad hex frame '{h}'")
+            frames.append(f if args.no_crc else f + crc_14b(f))
+        res = self._exchange(frames, regs, True, False, args.timeout)
+        self._print_header(res, regs)
+        for i, (f, fr) in enumerate(zip(frames, res["frames"])):
+            self._print_frame(f"frame {i}", f, fr)
+
+
+@hf_14b.command("st25tb")
+class HF14BST25TB(ReaderRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.formatter_class = argparse.RawDescriptionHelpFormatter
+        parser.description = (
+            "EXPERIMENTAL: read a ST25TB / SRIX (ISO14443-B) tag using software-generated\n"
+            "Type B frames and software BPSK demodulation of the RC522 ADC"
+        )
+        parser.epilog = (
+            "examples:\n"
+            "  hf 14b st25tb                  # UID only\n"
+            "  hf 14b st25tb -b 128           # ST25TB04K: UID + 128 blocks + system block\n"
+            "  hf 14b st25tb -b 128 -f d.bin  # also save blocks 0..127 to a file\n"
+        )
+        parser.add_argument("-b", "--blocks", type=int, default=0,
+                            help="number of blocks to read (ST25TB512: 16, 02K: 64, 04K: 128)")
+        parser.add_argument("-f", "--file", type=str, default=None, help="save read blocks to this binary file")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        import chameleon_14b_soft
+
+        tag = chameleon_14b_soft.SoftST25TB(self.cmd)
+        try:
+            chip_id = tag.initiate()
+            if chip_id is None:
+                print(color_string((CR, " - No ST25TB answer to INITIATE.")))
+                return
+            print(f" - Chip_ID: 0x{chip_id:02X}")
+            if not tag.select(chip_id):
+                print(color_string((CR, " - SELECT failed.")))
+                return
+            uid = tag.get_uid()
+            if uid is None:
+                print(color_string((CR, " - GET_UID failed.")))
+                return
+            print(f" - UID    : {color_string((CG, uid.hex().upper()))}")
+            if args.blocks <= 0:
+                return
+            dump = bytearray()
+            failed = []
+            for blk in list(range(args.blocks)) + [0xFF]:
+                data = tag.read_block(blk)
+                if data is None:
+                    failed.append(blk)
+                    data_s = color_string((CR, "-- read failed --"))
+                else:
+                    data_s = data.hex(" ").upper()
+                if blk != 0xFF:
+                    dump += data if data is not None else b"\x00\x00\x00\x00"
+                label = "sys" if blk == 0xFF else f"{blk:3d}"
+                print(f"   {label}: {data_s}")
+            if failed:
+                print(color_string((CY, f" - {len(failed)} block(s) could not be read: {failed}")))
+            if args.file:
+                with open(args.file, "wb") as fh:
+                    fh.write(dump)
+                print(f" - Saved {len(dump)} bytes to {args.file}")
+        finally:
+            tag.completion()
