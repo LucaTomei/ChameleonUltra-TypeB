@@ -62,6 +62,27 @@ hf 14b st25tb --wrbl 42 -d 11223344
 Blocks 0..4 (OTP, bits can only go 1 -> 0), 5..6 (count-down counters) and 255 (OTP lock bits)
 are irreversible and require `--force`.
 
+Dumps, comparison and restore:
+
+```
+hf 14b st25tb -b 128 -f d.bin         # read all blocks to a file
+hf 14b st25tb --diff d.bin            # list blocks that differ from the dump
+hf 14b st25tb --restore d.bin         # write back only the differing blocks, verified
+```
+
+Device vault: up to 8 named dumps stored in the Chameleon flash (FDS file `0x1300`), kept across
+reboots and firmware updates:
+
+```
+hf 14b st25tb --save-slot 1 --name card   # read the tag into vault slot 1
+hf 14b st25tb --diff-slot 1               # compare the tag with vault slot 1
+hf 14b st25tb --restore-slot 1            # restore the tag from vault slot 1
+hf 14b vault list | show -s 1 | delete -s 1
+hf 14b vault export -s 1 -f d.bin | import -s 2 -f d.bin --uid <hex> --name x
+```
+
+The vault stores data only: a ST25TB cannot be emulated by the Ultra (see Limitations).
+
 Low-level experimental commands:
 
 | Command | ID | Purpose |
@@ -69,6 +90,7 @@ Low-level experimental commands:
 | `hf 14b test` | 2050 | Write/read back RC522 registers and send raw frames with the native transceiver |
 | (client API) `hf14b_bitbang` | 2051 | Software-generated frame or arbitrary waveform, then receive and/or sample a register |
 | (client API) `hf14b_unlock_scan` | 2052 | On-device sweep of register pairs looking for writable bits |
+| `hf 14b vault ...` | 2060..2063 | Save / load / list / delete dump blobs in the device flash |
 
 Writable registers are limited to `0x11..0x3F`, excluding `TestPinEnReg` / `TestPinValueReg`
 (0x33/0x34): they enable output drivers on pins shared with the SPI bus.

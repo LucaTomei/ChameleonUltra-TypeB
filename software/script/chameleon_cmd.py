@@ -559,6 +559,33 @@ class ChameleonCMD:
         hits = [tuple(d[5 + i * 3:8 + i * 3]) for i in range(d[4])]
         return iterations, hits
 
+    def hf14b_vault_save(self, index, blob):
+        """Store an ISO14443-B dump blob in the device flash vault (index 0..7)."""
+        resp = self.device.send_cmd_sync(Command.HF14B_VAULT_SAVE, bytes([index]) + bytes(blob), timeout=5)
+        if resp.status != Status.SUCCESS:
+            raise UnexpectedResponseError(f"vault save failed, status={resp.status}")
+
+    def hf14b_vault_load(self, index):
+        """Return the blob stored at `index`, or None if the vault slot is empty."""
+        resp = self.device.send_cmd_sync(Command.HF14B_VAULT_LOAD, bytes([index]))
+        if resp.status == Status.FLASH_READ_FAIL:
+            return None
+        if resp.status != Status.SUCCESS:
+            raise UnexpectedResponseError(f"vault load failed, status={resp.status}")
+        return bytes(resp.data)
+
+    def hf14b_vault_list(self):
+        """Return the list of used vault indexes."""
+        resp = self.device.send_cmd_sync(Command.HF14B_VAULT_LIST)
+        if resp.status != Status.SUCCESS:
+            raise UnexpectedResponseError(f"vault list failed, status={resp.status}")
+        return [i for i in range(8) if resp.data[0] >> i & 1]
+
+    def hf14b_vault_delete(self, index):
+        resp = self.device.send_cmd_sync(Command.HF14B_VAULT_DELETE, bytes([index]))
+        if resp.status != Status.SUCCESS:
+            raise UnexpectedResponseError(f"vault delete failed, status={resp.status}")
+
     @expect_response(Status.HF_TAG_OK)
     def mf1_manipulate_value_block(
         self,

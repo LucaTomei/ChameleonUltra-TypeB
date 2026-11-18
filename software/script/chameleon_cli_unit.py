@@ -11809,17 +11809,19 @@ class HF14BST25TB(ReaderRequiredUnit):
         parser = ArgumentParserNoExit()
         parser.formatter_class = argparse.RawDescriptionHelpFormatter
         parser.description = (
-            "EXPERIMENTAL: read a ST25TB / SRIX (ISO14443-B) tag using software-generated\n"
+            "EXPERIMENTAL: read/write a ST25TB / SRIX (ISO14443-B) tag using software-generated\n"
             "Type B frames and software BPSK demodulation of the RC522 ADC"
         )
         parser.epilog = (
             "examples:\n"
-            "  hf 14b st25tb                  # UID only\n"
-            "  hf 14b st25tb -b 128           # ST25TB04K: UID + 128 blocks + system block\n"
-            "  hf 14b st25tb -b 128 -f d.bin  # also save blocks 0..127 to a file\n"
-            "  hf 14b st25tb --wrbl 42 -d 11223344   # write block 42 and verify\n"
-            "  hf 14b st25tb --diff d.bin            # compare the tag with a dump\n"
-            "  hf 14b st25tb --restore d.bin         # write back the blocks that differ\n"
+            "  hf 14b st25tb                          # Chip_ID + UID\n"
+            "  hf 14b st25tb -b 128 -f d.bin          # ST25TB04K: read all blocks, save to file\n"
+            "  hf 14b st25tb --wrbl 42 -d 11223344    # write block 42 and verify\n"
+            "  hf 14b st25tb --diff d.bin             # compare the tag with a dump file\n"
+            "  hf 14b st25tb --restore d.bin          # write back the blocks that differ\n"
+            "  hf 14b st25tb --save-slot 1 --name X   # read all blocks into device vault slot 1\n"
+            "  hf 14b st25tb --diff-slot 1            # compare the tag with vault slot 1\n"
+            "  hf 14b st25tb --restore-slot 1         # restore the tag from vault slot 1\n"
             "\n"
             "blocks 0..4 (OTP), 5..6 (count-down counters) and 255 (OTP lock bits) are\n"
             "irreversible: writing them requires --force\n"
@@ -11835,10 +11837,78 @@ class HF14BST25TB(ReaderRequiredUnit):
                             help="compare the tag with a dump file and list differing blocks")
         parser.add_argument("--restore", type=str, default=None, metavar="FILE",
                             help="write the blocks of a dump file that differ from the tag, with verification")
+        parser.add_argument("--save-slot", type=int, default=None, metavar="N",
+                            help="read all blocks (default 128, see -b) and store them in device vault slot N (1..8)")
+        parser.add_argument("--name", type=str, default="", help="name for --save-slot (max 32 bytes)")
+        parser.add_argument("--diff-slot", type=int, default=None, metavar="N", help="compare the tag with vault slot N")
+        parser.add_argument("--restore-slot", type=int, default=None, metavar="N",
+                            help="restore the tag from vault slot N, with verification")
         return parser
 
+    @staticmethod
+    def _slot_index(n):
+        if n is None:
+            return None
+        if not 1 <= n <= 8:
+            raise ArgsParserError("vault slots are 1..8")
+        return n - 1
+
+    def _load_reference(self, args, soft):
+        """Reference blocks for diff/restore from a file or a vault slot, or None."""
+        sources = [x for x in (args.diff, args.restore, args.diff_slot, args.restore_slot) if x is not None]
+        if len(sources) > 1:
+            raise ArgsParserError("use only one of --diff, --restore, --diff-slot, --restore-slot")
+        path = args.diff or args.restore
+        if path:
+            try:
+                with open(path, "rb") as fh:
+                    blocks = soft.dump_to_blocks(fh.read())
+            except (OSError, ValueError) as e:
+                raise ArgsParserError(f"cannot load dump '{path}': {e}")
+        elif args.diff_slot is not None or args.restore_slot is not None:
+            idx = self._slot_index(args.diff_slot if args.diff_slot is not None else args.restore_slot)
+            blob = self.cmd.hf14b_vault_load(idx)
+            if blob is None:
+                raise ArgsParserError(f"vault slot {idx + 1} is empty")
+            try:
+                blocks = soft.vault_unpack(blob)["blocks"]
+            except ValueError as e:
+                raise ArgsParserError(f"vault slot {idx + 1}: {e}")
+        else:
+            return None
+        if not 1 <= len(blocks) <= 128:
+            raise ArgsParserError(f"dump has {len(blocks)} blocks, expected 1..128")
+        return blocks
+
+    @staticmethod
+    def _show_diff(soft, tag, reference):
+        current = soft.read_blocks(tag, len(reference))
+        diffs = soft.diff_blocks(current, reference)
+        if not diffs:
+            print(color_string((CG, f" - Tag matches the dump ({len(reference)} blocks)")))
+            return
+        for blk, cur, ref in diffs:
+            cur_s = cur.hex(" ").upper() if cur else "unreadable "
+            print(f"   {blk:3d}: tag {color_string((CY, cur_s))}  dump {ref.hex(' ').upper()}")
+        print(color_string((CY, f" - {len(diffs)} block(s) differ")))
+
+    @staticmethod
+    def _do_restore(soft, tag, reference, force):
+        def show(blk, cur, ref, ok):
+            state = color_string((CG, "ok")) if ok else color_string((CR, "FAILED"))
+            cur_s = cur.hex(" ").upper() if cur else "??"
+            print(f"   {blk:3d}: {cur_s} -> {ref.hex(' ').upper()}  {state}")
+
+        written, skipped, failed = soft.restore_blocks(tag, reference, force, show)
+        identical = len(reference) - len(written) - len(failed) - len(skipped)
+        print(f" - Restore: {len(written)} written, {len(failed)} failed, {identical} already identical")
+        if skipped:
+            print(color_string((CY, f" - Skipped protected blocks {skipped} (use --force, irreversible)")))
+        if failed:
+            print(color_string((CR, f" - Failed blocks: {failed}")))
+
     def on_exec(self, args: argparse.Namespace):
-        import chameleon_14b_soft
+        import chameleon_14b_soft as soft
 
         write_data = None
         if args.wrbl is not None or args.data is not None:
@@ -11852,22 +11922,15 @@ class HF14BST25TB(ReaderRequiredUnit):
                 raise ArgsParserError("ST25TB blocks are 4 bytes (8 hex digits)")
             if not (0 <= args.wrbl <= 127 or args.wrbl == 0xFF):
                 raise ArgsParserError("block must be 0..127 or 255")
-            if (args.wrbl <= 6 or args.wrbl == 0xFF) and not args.force:
+            if (args.wrbl in soft.PROTECTED_BLOCKS) and not args.force:
                 raise ArgsParserError(f"block {args.wrbl} is OTP/counter/system (irreversible): add --force")
-        reference = None
-        if args.diff or args.restore:
-            if args.diff and args.restore:
-                raise ArgsParserError("use either --diff or --restore")
-            path = args.diff or args.restore
-            try:
-                with open(path, "rb") as fh:
-                    reference = chameleon_14b_soft.dump_to_blocks(fh.read())
-            except (OSError, ValueError) as e:
-                raise ArgsParserError(f"cannot load dump '{path}': {e}")
-            if not 1 <= len(reference) <= 128:
-                raise ArgsParserError(f"dump has {len(reference)} blocks, expected 1..128")
+        save_idx = self._slot_index(args.save_slot)
+        if len(args.name.encode("utf-8")) > 32:
+            raise ArgsParserError("--name is limited to 32 bytes")
+        reference = self._load_reference(args, soft)
+        n_blocks = args.blocks if args.blocks > 0 else (128 if save_idx is not None else 0)
 
-        tag = chameleon_14b_soft.SoftST25TB(self.cmd)
+        tag = soft.SoftST25TB(self.cmd)
         try:
             chip_id = tag.initiate()
             if chip_id is None:
@@ -11882,30 +11945,14 @@ class HF14BST25TB(ReaderRequiredUnit):
                 print(color_string((CR, " - GET_UID failed.")))
                 return
             print(f" - UID    : {color_string((CG, uid.hex().upper()))}")
-            if reference is not None and args.diff:
-                current = chameleon_14b_soft.read_blocks(tag, len(reference))
-                diffs = chameleon_14b_soft.diff_blocks(current, reference)
-                if not diffs:
-                    print(color_string((CG, f" - Tag matches the dump ({len(reference)} blocks)")))
-                for blk, cur, ref in diffs:
-                    cur_s = cur.hex(" ").upper() if cur else "unreadable "
-                    print(f"   {blk:3d}: tag {color_string((CY, cur_s))}  dump {ref.hex(' ').upper()}")
-                if diffs:
-                    print(color_string((CY, f" - {len(diffs)} block(s) differ")))
+
+            if reference is not None:
+                if args.diff or args.diff_slot is not None:
+                    self._show_diff(soft, tag, reference)
+                else:
+                    self._do_restore(soft, tag, reference, args.force)
                 return
-            if reference is not None and args.restore:
-                def show(blk, cur, ref, ok):
-                    state = color_string((CG, "ok")) if ok else color_string((CR, "FAILED"))
-                    cur_s = cur.hex(" ").upper() if cur else "??"
-                    print(f"   {blk:3d}: {cur_s} -> {ref.hex(' ').upper()}  {state}")
-                written, skipped, failed = chameleon_14b_soft.restore_blocks(tag, reference, args.force, show)
-                print(f" - Restore: {len(written)} written, {len(failed)} failed, "
-                      f"{len(reference) - len(written) - len(failed) - len(skipped)} already identical")
-                if skipped:
-                    print(color_string((CY, f" - Skipped protected blocks {skipped} (use --force, irreversible)")))
-                if failed:
-                    print(color_string((CR, f" - Failed blocks: {failed}")))
-                return
+
             if write_data is not None:
                 before = tag.read_block(args.wrbl)
                 print(f" - Block {args.wrbl} before: {before.hex(' ').upper() if before else '?'}")
@@ -11913,26 +11960,159 @@ class HF14BST25TB(ReaderRequiredUnit):
                     print(color_string((CG, f" - Block {args.wrbl} written and verified: {write_data.hex(' ').upper()}")))
                 else:
                     print(color_string((CR, f" - Block {args.wrbl} write could not be verified")))
-            if args.blocks <= 0:
+
+            if n_blocks <= 0:
                 return
-            dump = bytearray()
-            failed = []
-            for blk in list(range(args.blocks)) + [0xFF]:
+            blocks, failed = [], []
+            for blk in range(n_blocks):
                 data = tag.read_block(blk)
+                blocks.append(data)
                 if data is None:
                     failed.append(blk)
-                    data_s = color_string((CR, "-- read failed --"))
-                else:
-                    data_s = data.hex(" ").upper()
-                if blk != 0xFF:
-                    dump += data if data is not None else b"\x00\x00\x00\x00"
-                label = "sys" if blk == 0xFF else f"{blk:3d}"
-                print(f"   {label}: {data_s}")
+                print(f"   {blk:3d}: {data.hex(' ').upper() if data else color_string((CR, '-- read failed --'))}")
+            sys_block = tag.read_block(0xFF)
+            print(f"   sys: {sys_block.hex(' ').upper() if sys_block else color_string((CR, '-- read failed --'))}")
             if failed:
                 print(color_string((CY, f" - {len(failed)} block(s) could not be read: {failed}")))
             if args.file:
                 with open(args.file, "wb") as fh:
-                    fh.write(dump)
-                print(f" - Saved {len(dump)} bytes to {args.file}")
+                    fh.write(b"".join(b if b else b"\x00" * 4 for b in blocks))
+                print(f" - Saved {n_blocks * 4} bytes to {args.file}")
+            if save_idx is not None:
+                if failed:
+                    print(color_string((CR, " - Not saved to the vault: some blocks could not be read")))
+                    return
+                blob = soft.vault_pack(uid, blocks, sys_block, args.name)
+                self.cmd.hf14b_vault_save(save_idx, blob)
+                if self.cmd.hf14b_vault_load(save_idx) != blob:
+                    print(color_string((CR, f" - Vault slot {save_idx + 1}: verification failed")))
+                    return
+                print(color_string((CG, f" - Saved to vault slot {save_idx + 1}"
+                                        f"{' (' + args.name + ')' if args.name else ''}: {n_blocks} blocks")))
         finally:
             tag.completion()
+
+
+hf_14b_vault = hf_14b.subgroup("vault", "ISO14443-B dump vault stored in the device flash")
+
+
+def _vault_index(n):
+    if not 1 <= n <= 8:
+        raise ArgsParserError("vault slots are 1..8")
+    return n - 1
+
+
+@hf_14b_vault.command("list")
+class HF14BVaultList(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "List the ST25TB dumps stored in the device vault"
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        import chameleon_14b_soft as soft
+
+        used = self.cmd.hf14b_vault_list()
+        for idx in range(soft.VAULT_SLOTS):
+            if idx not in used:
+                print(f" - Slot {idx + 1}: (empty)")
+                continue
+            try:
+                rec = soft.vault_unpack(self.cmd.hf14b_vault_load(idx) or b"")
+                print(f" - Slot {idx + 1}: UID {rec['uid'].hex().upper()}  {len(rec['blocks'])} blocks"
+                      f"{'  ' + color_string((CG, rec['name'])) if rec['name'] else ''}")
+            except ValueError as e:
+                print(color_string((CR, f" - Slot {idx + 1}: unreadable record ({e})")))
+
+
+@hf_14b_vault.command("show")
+class HF14BVaultShow(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Show a ST25TB dump stored in the device vault"
+        parser.add_argument("-s", "--slot", type=int, required=True, help="vault slot 1..8")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        import chameleon_14b_soft as soft
+
+        idx = _vault_index(args.slot)
+        blob = self.cmd.hf14b_vault_load(idx)
+        if blob is None:
+            print(f" - Slot {idx + 1} is empty")
+            return
+        rec = soft.vault_unpack(blob)
+        print(f" - Name : {rec['name'] or '-'}")
+        print(f" - UID  : {rec['uid'].hex().upper()}")
+        for blk, data in enumerate(rec["blocks"]):
+            print(f"   {blk:3d}: {data.hex(' ').upper()}")
+        if rec["sys"] is not None:
+            print(f"   sys: {rec['sys'].hex(' ').upper()}")
+
+
+@hf_14b_vault.command("delete")
+class HF14BVaultDelete(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Delete a ST25TB dump from the device vault"
+        parser.add_argument("-s", "--slot", type=int, required=True, help="vault slot 1..8")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        idx = _vault_index(args.slot)
+        self.cmd.hf14b_vault_delete(idx)
+        print(f" - Slot {idx + 1} deleted")
+
+
+@hf_14b_vault.command("export")
+class HF14BVaultExport(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Export the blocks of a vault slot to a binary dump file"
+        parser.add_argument("-s", "--slot", type=int, required=True, help="vault slot 1..8")
+        parser.add_argument("-f", "--file", type=str, required=True, help="output binary dump file")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        import chameleon_14b_soft as soft
+
+        idx = _vault_index(args.slot)
+        blob = self.cmd.hf14b_vault_load(idx)
+        if blob is None:
+            print(f" - Slot {idx + 1} is empty")
+            return
+        rec = soft.vault_unpack(blob)
+        with open(args.file, "wb") as fh:
+            fh.write(b"".join(rec["blocks"]))
+        print(f" - Exported {len(rec['blocks'])} blocks of slot {idx + 1} to {args.file}")
+
+
+@hf_14b_vault.command("import")
+class HF14BVaultImport(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Import a binary dump file into a vault slot"
+        parser.add_argument("-s", "--slot", type=int, required=True, help="vault slot 1..8")
+        parser.add_argument("-f", "--file", type=str, required=True, help="binary dump file (blocks 0..N-1)")
+        parser.add_argument("--uid", type=str, default="", help="UID to record with the dump (hex, 8 bytes)")
+        parser.add_argument("--name", type=str, default="", help="name (max 32 bytes)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        import chameleon_14b_soft as soft
+
+        idx = _vault_index(args.slot)
+        try:
+            with open(args.file, "rb") as fh:
+                blocks = soft.dump_to_blocks(fh.read())
+            uid = bytes.fromhex(args.uid) if args.uid else b"\x00" * 8
+        except (OSError, ValueError) as e:
+            raise ArgsParserError(str(e))
+        if not 1 <= len(blocks) <= 128 or len(uid) != 8 or len(args.name.encode("utf-8")) > 32:
+            raise ArgsParserError("expected 1..128 blocks, an 8-byte UID and a name of at most 32 bytes")
+        blob = soft.vault_pack(uid, blocks, None, args.name)
+        self.cmd.hf14b_vault_save(idx, blob)
+        if self.cmd.hf14b_vault_load(idx) != blob:
+            print(color_string((CR, " - Verification failed")))
+            return
+        print(f" - Imported {len(blocks)} blocks into slot {idx + 1}")

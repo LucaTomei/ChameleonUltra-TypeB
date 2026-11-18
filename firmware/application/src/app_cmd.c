@@ -1,4 +1,5 @@
 #include "fds_util.h"
+#include "fds_ids.h"
 #include "bsp_time.h"
 #include "bsp_delay.h"
 #include "usb_main.h"
@@ -3536,6 +3537,62 @@ static data_frame_tx_t *cmd_processor_hf14b_unlock_scan(uint16_t cmd, uint16_t s
     out[4] = n_hits;
     return data_frame_make(cmd, STATUS_HF_TAG_OK, 5 + n_hits * 3, out);
 }
+
+/**
+ * ISO14443-B dump vault: opaque blobs (format defined by the client) stored in
+ * flash, one FDS record per index. Records hold a u16 length prefix so the exact
+ * blob size survives the word padding of FDS.
+ */
+static uint8_t s_hf14b_vault_buf[FDS_HF14B_VAULT_MAX_SIZE + 4] __attribute__((aligned(4)));
+
+static data_frame_tx_t *cmd_processor_hf14b_vault_save(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // request: u8 index, blob
+    if (length < 2 || data[0] >= FDS_HF14B_VAULT_SLOTS || length - 1 > FDS_HF14B_VAULT_MAX_SIZE) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t blob_len = length - 1;
+    s_hf14b_vault_buf[0] = blob_len >> 8;
+    s_hf14b_vault_buf[1] = blob_len & 0xFF;
+    memcpy(&s_hf14b_vault_buf[2], &data[1], blob_len);
+    bool ok = fds_write_sync(FDS_HF14B_VAULT_FILE_ID, data[0] + 1, blob_len + 2, s_hf14b_vault_buf);
+    return data_frame_make(cmd, ok ? STATUS_SUCCESS : STATUS_FLASH_WRITE_FAIL, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_hf14b_vault_load(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // request: u8 index -> response: blob
+    if (length != 1 || data[0] >= FDS_HF14B_VAULT_SLOTS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t len = sizeof(s_hf14b_vault_buf);
+    if (!fds_read_sync(FDS_HF14B_VAULT_FILE_ID, data[0] + 1, &len, s_hf14b_vault_buf) || len < 2) {
+        return data_frame_make(cmd, STATUS_FLASH_READ_FAIL, 0, NULL);
+    }
+    uint16_t blob_len = ((uint16_t)s_hf14b_vault_buf[0] << 8) | s_hf14b_vault_buf[1];
+    if (blob_len + 2 > len) {
+        return data_frame_make(cmd, STATUS_FLASH_READ_FAIL, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, blob_len, &s_hf14b_vault_buf[2]);
+}
+
+static data_frame_tx_t *cmd_processor_hf14b_vault_list(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // response: u8 bitmap of used indexes
+    uint8_t bitmap = 0;
+    for (uint8_t i = 0; i < FDS_HF14B_VAULT_SLOTS; i++) {
+        if (fds_is_exists(FDS_HF14B_VAULT_FILE_ID, i + 1)) {
+            bitmap |= 1 << i;
+        }
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &bitmap);
+}
+
+static data_frame_tx_t *cmd_processor_hf14b_vault_delete(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // request: u8 index
+    if (length != 1 || data[0] >= FDS_HF14B_VAULT_SLOTS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    fds_delete_sync(FDS_HF14B_VAULT_FILE_ID, data[0] + 1);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
 #endif
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
@@ -3717,6 +3774,10 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14B_RAW_TEST,                 before_reader_run,           cmd_processor_hf14b_raw_test,                NULL                   },
     {    DATA_CMD_HF14B_BITBANG,                  before_reader_run,           cmd_processor_hf14b_bitbang,                 NULL                   },
     {    DATA_CMD_HF14B_UNLOCK_SCAN,              before_reader_run,           cmd_processor_hf14b_unlock_scan,             NULL                   },
+    {    DATA_CMD_HF14B_VAULT_SAVE,               NULL,                        cmd_processor_hf14b_vault_save,              NULL                   },
+    {    DATA_CMD_HF14B_VAULT_LOAD,               NULL,                        cmd_processor_hf14b_vault_load,              NULL                   },
+    {    DATA_CMD_HF14B_VAULT_LIST,               NULL,                        cmd_processor_hf14b_vault_list,              NULL                   },
+    {    DATA_CMD_HF14B_VAULT_DELETE,             NULL,                        cmd_processor_hf14b_vault_delete,            NULL                   },
 #endif
 };
 data_frame_tx_t *cmd_processor_get_device_capabilities(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {

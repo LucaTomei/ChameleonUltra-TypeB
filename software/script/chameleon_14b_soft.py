@@ -268,3 +268,37 @@ def restore_blocks(tag, reference, force=False, progress=None):
         if progress:
             progress(blk, cur, ref, ok)
     return written, skipped, failed
+
+
+# ---------------------------------------------------------------------------
+# Device vault blob format (stored opaque by the firmware), version 1:
+#   "STB1" | u8 version | u8 block_count | u8 flags (bit0: system block present) | u8 reserved
+#   uid[8] (display order) | sys[4] | name[32] (utf-8, zero padded) | blocks[block_count * 4]
+# ---------------------------------------------------------------------------
+VAULT_SLOTS = 8
+_VAULT_MAGIC = b"STB1"
+
+
+def vault_pack(uid, blocks, sys_block=None, name=""):
+    if len(blocks) > 128:
+        raise ValueError("at most 128 blocks")
+    name_b = name.encode("utf-8")[:32]
+    head = _VAULT_MAGIC + bytes([1, len(blocks), 1 if sys_block else 0, 0])
+    body = bytes(uid or b"\x00" * 8)[:8].ljust(8, b"\x00") + bytes(sys_block or b"\xff" * 4)
+    body += name_b.ljust(32, b"\x00")
+    return head + body + b"".join(bytes(b) for b in blocks)
+
+
+def vault_unpack(blob):
+    """Returns dict(uid, sys, name, blocks) or raises ValueError."""
+    if len(blob) < 52 or blob[:4] != _VAULT_MAGIC or blob[4] != 1:
+        raise ValueError("not a ST25TB vault record")
+    count, flags = blob[5], blob[6]
+    if len(blob) < 52 + count * 4:
+        raise ValueError("truncated vault record")
+    return {
+        "uid": blob[8:16],
+        "sys": blob[16:20] if flags & 1 else None,
+        "name": blob[20:52].rstrip(b"\x00").decode("utf-8", "replace"),
+        "blocks": [blob[52 + i * 4:56 + i * 4] for i in range(count)],
+    }

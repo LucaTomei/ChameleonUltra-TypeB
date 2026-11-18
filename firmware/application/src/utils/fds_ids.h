@@ -32,6 +32,14 @@
  */
 #define FDS_SLOT_TAG_NICK_NAME_FILE_ID_BASE 0x1200
 
+/*
+ * ST25TB / ISO14443-B dump vault: one record per vault index
+ * FDS record key is the vault index + 1 (1..8)
+ */
+#define FDS_HF14B_VAULT_FILE_ID             0x1300
+#define FDS_HF14B_VAULT_SLOTS               8
+#define FDS_HF14B_VAULT_MAX_SIZE            1024
+
 // Note that previously assigned records may need to be cleaned from Flash.
 // Taking into account the possible overlaps, it boils down to
 // ID 0x1066 Keys 0x1066
