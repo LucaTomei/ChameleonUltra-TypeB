@@ -1,9 +1,43 @@
 # ISO14443-B on the Chameleon Ultra
 
-Experimental support for ISO14443-B tags on the Chameleon Ultra reader, currently able to fully
-read **ST25TB / SRIX** tags (tested with a ST25TB04K: UID + 128 blocks + system block).
+By Luca Tomei. This is how I made the Chameleon Ultra read and write **ST25TB / SRIX** tags
+(ISO14443-B) even though its reader chip does not support Type B. Tested with a ST25TB04K:
+UID, 128 blocks, system block, block writes, all cross-checked with a Flipper Zero.
 
-## Why it is not trivial
+## How I got there
+
+1. **The baseline.** `hf 14a scan` on a ST25TB04K: nothing, as expected, since the tag only speaks
+   Type B. The schematic shows the Ultra's reader chip is a **Ci522**, an MFRC522-compatible part.
+2. **Looking for native Type B.** I added a command to write and read back any reader register.
+   The framing bits `[1:0]` of `TxModeReg` / `RxModeReg` never stick: they read back `00` (Type A).
+   Mapping every writable bit showed the die clearly derives from an A/B capable chip
+   (`TypeBReg`, `TxBitPhaseReg`, `GsNOffReg` with PN512-like reset values), so I looked for a hidden
+   unlock: single registers, then an on-device sweep of **every pair** of configuration, reserved and
+   test registers (27.5 million combinations). Nothing unlocks them. In self-test mode
+   (`AutoTestReg` = `x9`) the bits do store `11`, but the RF front-end is then inactive. The chip
+   package does not expose `MFIN`, `MFOUT` or `AUX` either. Conclusion: native Type B is fused off.
+3. **Transmitting Type B myself.** RC522-family chips write every byte that follows the address byte
+   to the same register. Switching the nRF52840 SPI to its EasyDMA mode for a single burst, I can
+   rewrite `CWGsPReg` (the carrier driver conductance) every ~1 us (measured 1002.5 ns per byte),
+   which is enough to draw SOF, characters and EOF with 10% ASK at 9.44 us per bit.
+4. **Validating the transmitter on a known case.** I used the same technique to generate an
+   ISO14443-A REQA in software (modified Miller, 100% ASK pauses through `TxControlReg`): a MIFARE
+   Classic answered with its ATQA 10/10 times. Along the way I found and fixed a subtle bug: after
+   the DMA burst the legacy SPI kept a stale byte, shifting every later register read by one.
+5. **Hearing the tag.** The RC522 receiver cannot decode BPSK, but `TestADCReg` exposes its I/Q ADC.
+   Sampling it in a second DMA burst while the receiver runs, I built an answer detector, validated on
+   the MIFARE (102 active samples when it answers, 5 when silent). On the ST25TB, a valid INITIATE gave
+   ~640 active samples and a corrupted-CRC copy ~85: **the tag was answering my software frames.**
+6. **Decoding it.** The 847.5 kHz subcarrier sampled at ~1 MS/s aliases to ~150 kHz. I estimate that
+   frequency on the squared signal (squaring removes the BPSK), mix it down, filter it, take the phase
+   against TR1, find the SOF and slice bits at 1 etu. The first INITIATE answers came back with valid
+   CRC_B, then SELECT, GET_UID and all the blocks.
+7. **Making it solid.** Block writing with read-back verification and protection of the irreversible
+   blocks, diff and restore, a dump vault in the Ultra's flash, Flipper Zero `.nfc` files byte for
+   byte identical to the Flipper's own, and automatic modulation search. I verified reads, writes and
+   files against a Flipper Zero, and reading with the tag offset, lifted and rotated (15/15).
+
+## Why native Type B is impossible on this chip
 
 The Ultra uses a **Ci522** reader chip (MFRC522-compatible). Its register map clearly derives from
 an A/B capable die (it has `TypeBReg`, `TxBitPhaseReg`, `GsNOffReg` with PN512-like defaults),
@@ -11,7 +45,7 @@ but the framing bits `[1:0]` of `TxModeReg` / `RxModeReg` are hard-wired to `00`
 they never store a written value, and no combination of up to two configuration, reserved or test
 registers unlocks them. The chip package also does not expose `MFIN` / `MFOUT` / `AUX`.
 
-So Type B has to be done in software, in both directions.
+So I do Type B in software, in both directions.
 
 ## How it works
 
