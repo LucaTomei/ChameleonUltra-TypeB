@@ -94,6 +94,7 @@
 #define DATA_CMD_HF14B_BITBANG                  (2051)  /* experimental: software-generated ISO14443-B frame via SPI burst modulation */
 #define DATA_CMD_HF14B_UNLOCK_SCAN              (2052)  /* experimental: on-device register pair sweep looking for hidden unlocks */
 #define DATA_CMD_HF14B_READ_BLOCKS              (2053)  /* read a run of ST25TB blocks in one call (batched sample capture, host demod) */
+#define DATA_CMD_HF14B_TEAROFF                  (2054)  /* ST25TB tear-off: send WRITE then cut the field after a precise delay (OTP/counter glitch) */
 #define DATA_CMD_HF14B_VAULT_SAVE               (2060)  /* store an opaque ISO14443-B dump blob in flash (index 0..7) */
 #define DATA_CMD_HF14B_VAULT_LOAD               (2061)  /* read back a stored dump blob */
 #define DATA_CMD_HF14B_VAULT_LIST               (2062)  /* bitmap of used vault indexes */

@@ -3470,6 +3470,79 @@ static data_frame_tx_t *cmd_processor_hf14b_bitbang(uint16_t cmd, uint16_t statu
     return data_frame_make(cmd, STATUS_HF_TAG_OK, n, o);
 }
 
+/*
+ * ST25TB / SRIx TEAR-OFF.
+ *
+ * Sends one ISO14443-B WRITE (0x09) frame to the already-selected tag, lets the
+ * EEPROM programming cycle run for `tear_us` microseconds, then yanks the RF
+ * field for `off_us` microseconds before restoring it. Cutting power part-way
+ * through the self-timed EEPROM write latches a partial/old value, which on the
+ * OTP counter and lock blocks can raise a count that can normally only go down.
+ *
+ * The host is expected to have opened the session (INITIATE + SELECT) in the
+ * immediately preceding commands; the field stays on between commands, so this
+ * handler never resets. After the tear the field is back on but the PICC lost
+ * power, so the host must re-INITIATE before reading the result back.
+ *
+ * request (BE): u8 mod_reg, u8 hi, u8 lo, u16 etu_q8, u8 sof_low, u8 sof_high,
+ *               u8 eof_low, u8 egt, u16 tear_us, u16 off_us, u8 frame_len,
+ *               frame (payload + CRC-B already appended, <= 16 bytes)
+ * response:     u8 tx_ok (1 = the WRITE burst reported STATUS_HF_TAG_OK)
+ */
+static data_frame_tx_t *cmd_processor_hf14b_tearoff(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    hf14b_bb_params_t p;
+    hf14b_bb_result_t res;
+    if (length < 14) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t pos = 0;
+    p.mod_reg = data[pos++];
+    p.hi = data[pos++];
+    p.lo = data[pos++];
+    p.etu_q8 = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.sof_low = data[pos++];
+    p.sof_high = data[pos++];
+    p.eof_low = data[pos++];
+    p.egt = data[pos++];
+    uint16_t tear_us = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    uint16_t off_us = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    uint8_t frame_len = data[pos++];
+
+    p.rx_mode = 0;
+    p.n_samples = 0;
+    p.sample_reg = 0x3B;
+    p.timeout_ms = DEF_COM_TIMEOUT;
+
+    if (p.mod_reg < ModeReg || p.mod_reg > TCounterValueRegL || p.etu_q8 < 256 ||
+            p.sof_low > 32 || p.sof_high > 32 || p.eof_low > 32 || p.egt > 32 ||
+            frame_len == 0 || frame_len > 16 || pos + frame_len > length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (off_us == 0) {
+        off_us = 1500;              // default field gap so the PICC fully resets
+    }
+    if (off_us > 20000) {
+        off_us = 20000;             // cap the busy-wait at 20 ms
+    }
+
+    // Field is already on (host opened the session); transmit the WRITE frame.
+    status = pcd_14b_bitbang_transceive(&p, &data[pos], frame_len, &res, s_hf14b_bb_samples);
+
+    // Precisely timed tear: let the EEPROM self-program, then cut the carrier.
+    if (tear_us > 0) {
+        bsp_delay_us(tear_us);
+    }
+    pcd_14a_reader_antenna_off();
+    bsp_delay_us(off_us);
+    pcd_14a_reader_antenna_on();
+
+    uint8_t tx_ok = (status == STATUS_HF_TAG_OK) ? 1 : 0;
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, 1, &tx_ok);
+}
+
 /* ISO/IEC 13239 CRC-B over `len` bytes; writes the two-byte CRC at d[len], d[len+1]. */
 static void crc14b_append(uint8_t *d, uint8_t len) {
     uint16_t crc = 0xFFFF;
@@ -4077,6 +4150,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14B_BITBANG,                  before_reader_run,           cmd_processor_hf14b_bitbang,                 NULL                   },
     {    DATA_CMD_HF14B_UNLOCK_SCAN,              before_reader_run,           cmd_processor_hf14b_unlock_scan,             NULL                   },
     {    DATA_CMD_HF14B_READ_BLOCKS,              before_reader_run,           cmd_processor_hf14b_read_blocks,             NULL                   },
+    {    DATA_CMD_HF14B_TEAROFF,                  before_reader_run,           cmd_processor_hf14b_tearoff,                 NULL                   },
     {    DATA_CMD_HF14B_VAULT_SAVE,               NULL,                        cmd_processor_hf14b_vault_save,              NULL                   },
     {    DATA_CMD_HF14B_VAULT_LOAD,               NULL,                        cmd_processor_hf14b_vault_load,              NULL                   },
     {    DATA_CMD_HF14B_VAULT_LIST,               NULL,                        cmd_processor_hf14b_vault_list,              NULL                   },
