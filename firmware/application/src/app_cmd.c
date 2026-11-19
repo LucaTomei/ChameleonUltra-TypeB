@@ -25,6 +25,7 @@
 #include "parity.h"
 #endif
 #include "nfc_14a.h"
+#include <math.h>
 /* Forward declarations for functions added to nfc_14a.c/h in this PR.
  * These are declared here to avoid build failure if nfc_14a.h is not yet
  * updated on the build system. */
@@ -3469,6 +3470,307 @@ static data_frame_tx_t *cmd_processor_hf14b_bitbang(uint16_t cmd, uint16_t statu
     return data_frame_make(cmd, STATUS_HF_TAG_OK, n, o);
 }
 
+/* ISO/IEC 13239 CRC-B over `len` bytes; writes the two-byte CRC at d[len], d[len+1]. */
+static void crc14b_append(uint8_t *d, uint8_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= d[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 1) ? ((crc >> 1) ^ 0x8408) : (crc >> 1);
+        }
+    }
+    crc = ~crc;
+    d[len] = crc & 0xFF;
+    d[len + 1] = (crc >> 8) & 0xFF;
+}
+
+/**
+ * Read a run of ST25TB blocks in one call. The host must have an open session
+ * (INITIATE/SELECT done) and passes the same bit-bang modulation parameters.
+ * For each block the firmware transmits READ_BLOCK (0x08, block)+CRC and captures
+ * the raw ADC samples; demodulation stays on the host (unchanged, CRC-gated), so
+ * a sampling glitch can only cost a re-read, never corrupt data.
+ *
+ * request:  (same param block as HF14B_BITBANG up to sample_reg)
+ *           u8 n_regs, n_regs*{u8 reg,u8 value}, u8 start, u8 count
+ * response: for each block read: u8 block, u8 spi_check, u16 n_samples, samples
+ *           (fewer than `count` blocks come back if the 4 KB frame fills up)
+ */
+/* True if the two trailing bytes of d[0..len) are a valid ISO13239 CRC-B. */
+static bool crc14b_ok(const uint8_t *d, uint8_t len) {
+    if (len < 3) {
+        return false;
+    }
+    uint8_t tmp[24];
+    if (len > sizeof(tmp)) {
+        return false;
+    }
+    memcpy(tmp, d, len - 2);
+    crc14b_append(tmp, (uint8_t)(len - 2));
+    return tmp[len - 2] == d[len - 2] && tmp[len - 1] == d[len - 1];
+}
+
+/* ---- On-device BPSK demodulator (port of St25tb.bpskDecode) ---- */
+#define RB_N 1152
+static float s_dm_sig[RB_N];      // signed nibble samples, then mean-removed segment
+static float s_dm_zr[RB_N];       // demixed real
+static float s_dm_zi[RB_N];       // demixed imag
+static float s_dm_azr[RB_N];      // moving-averaged real
+static float s_dm_azi[RB_N];      // moving-averaged imag
+static float s_dm_soft[RB_N];     // soft bit stream
+#define RB_ETU 9.4186f            // samples per etu (128/13.56/1.0025)
+#define RB_PI  3.14159265358979323846f
+
+/* Decode one ISO14443-B PICC frame from ADC samples. ch 0 = Q (low nibble),
+ * 1 = I (high nibble). Writes the frame (data + 2 CRC bytes) into out and
+ * returns its length, or 0 on failure. */
+static uint8_t st25_bpsk_decode(const uint8_t *samples, uint16_t ns, uint8_t ch, float thr,
+                                float freq_in, float *freq_out, uint8_t *out, uint8_t out_cap) {
+    if (ns < 20u * (uint16_t)RB_ETU || ns > RB_N) {
+        return 0;
+    }
+    // 1) channel -> signed float
+    for (uint16_t i = 0; i < ns; i++) {
+        int v = ch ? (samples[i] >> 4) : (samples[i] & 0x0F);
+        if (v > 7) v -= 16;
+        s_dm_sig[i] = (float)v;
+    }
+    // 2) active span via sliding RMS (window 12)
+    int first = -1, last = -1;
+    for (uint16_t i = 0; i < ns; i++) {
+        int lo = (int)i - 6; if (lo < 0) lo = 0;
+        int hi = (int)i + 6; if (hi > (int)ns) hi = ns;
+        int cnt = hi - lo;
+        float m = 0; for (int k = lo; k < hi; k++) m += s_dm_sig[k]; m /= cnt;
+        float var = 0; for (int k = lo; k < hi; k++) { float dd = s_dm_sig[k] - m; var += dd * dd; }
+        float rms = sqrtf(var / cnt);
+        if (rms > thr) { if (first < 0) first = i; last = i; }
+    }
+    if (first < 0) return 0;
+    int a = first + 2, b = last;
+    if (b <= a) return 0;
+    int segN = b - a;
+    if (segN < (int)(20.0f * RB_ETU) || segN > RB_N) return 0;
+    // 3) mean-remove segment (in place at s_dm_sig[0..segN))
+    float mean = 0; for (int k = 0; k < segN; k++) mean += s_dm_sig[a + k]; mean /= segN;
+    for (int k = 0; k < segN; k++) s_dm_sig[k] = s_dm_sig[a + k] - mean;
+    // 4) subcarrier frequency: reuse a cached estimate when given (fast path), otherwise
+    //    search |sum seg^2 * exp(-i*4pi f n)|. The frequency is stable within a session, so
+    //    searching once and reusing it across blocks avoids the per-block search cost.
+    float bestF;
+    if (freq_in > 0.0f) {
+        bestF = freq_in;
+    } else {
+        bestF = 0; float bestS = -1;
+        for (int pass = 0; pass < 2; pass++) {
+            float lo, hi, inc;
+            if (pass == 0) { lo = 0.10f; hi = 0.20f; inc = 0.0005f; }
+            else { lo = bestF - 25 * 0.00002f; hi = bestF + 25 * 0.00002f; inc = 0.00002f; }
+            for (float f = lo; f <= hi + 1e-9f; f += inc) {
+                float wr = cosf(-4.0f * RB_PI * f), wi = sinf(-4.0f * RB_PI * f);
+                float pr = 1, pi = 0, ar = 0, ai = 0;
+                for (int k = 0; k < segN; k++) {
+                    float sq = s_dm_sig[k] * s_dm_sig[k];
+                    ar += sq * pr; ai += sq * pi;
+                    float npr = pr * wr - pi * wi, npi = pr * wi + pi * wr; pr = npr; pi = npi;
+                    if ((k & 63) == 0) { float mg = sqrtf(pr * pr + pi * pi); if (mg > 0) { pr /= mg; pi /= mg; } }
+                }
+                float s = sqrtf(ar * ar + ai * ai);
+                if (s > bestS) { bestS = s; bestF = f; }
+            }
+        }
+    }
+    if (freq_out) *freq_out = bestF;
+    // 5) demix: z[n] = seg[n] * exp(-i*2pi f n)
+    {
+        float wr = cosf(-2.0f * RB_PI * bestF), wi = sinf(-2.0f * RB_PI * bestF);
+        float pr = 1, pi = 0;
+        for (int k = 0; k < segN; k++) {
+            s_dm_zr[k] = s_dm_sig[k] * pr; s_dm_zi[k] = s_dm_sig[k] * pi;
+            float npr = pr * wr - pi * wi, npi = pr * wi + pi * wr; pr = npr; pi = npi;
+            if ((k & 63) == 0) { float mg = sqrtf(pr * pr + pi * pi); if (mg > 0) { pr /= mg; pi /= mg; } }
+        }
+    }
+    // 6) moving average window [-3,+3] into separate buffers (no in-place aliasing)
+    for (int k = 0; k < segN; k++) {
+        int lo = k - 3; if (lo < 0) lo = 0;
+        int hi = k + 4; if (hi > segN) hi = segN;
+        float sr = 0, si = 0; for (int j = lo; j < hi; j++) { sr += s_dm_zr[j]; si += s_dm_zi[j]; }
+        int c = hi - lo; s_dm_azr[k] = sr / c; s_dm_azi[k] = si / c;
+    }
+    // 7) phase reference over first 4 etu
+    int refLen = (int)(4.0f * RB_ETU);
+    if (refLen > segN) refLen = segN;
+    float refr = 0, refi = 0;
+    for (int k = 0; k < refLen; k++) { refr += s_dm_azr[k]; refi += s_dm_azi[k]; }
+    float ra = sqrtf(refr * refr + refi * refi);
+    if (ra > 0) { refr /= ra; refi /= ra; } else { refr = 1; refi = 0; }
+    // 8) soft decision: real(z * conj(ref))
+    for (int k = 0; k < segN; k++) s_dm_soft[k] = s_dm_azr[k] * refr + s_dm_azi[k] * refi;
+    // 9) SOF: first run of >= 8 etu negative
+    int sof = -1;
+    int lim = segN - (int)(10.0f * RB_ETU);
+    for (int i = refLen; i < lim; ) {
+        if (s_dm_soft[i] < 0) {
+            int j = i; while (j < segN && s_dm_soft[j] < 0) j++;
+            if ((j - i) >= (int)(8.0f * RB_ETU)) { sof = i; break; }
+            i = j;
+        }
+        i++;
+    }
+    if (sof < 0) return 0;
+    int j = sof; while (j < segN && s_dm_soft[j] < 0) j++;
+    int kk = j; while (kk < segN && s_dm_soft[kk] > 0) kk++;
+    // 10) sample 10-bit characters
+    uint8_t len = 0;
+    float pos = (float)kk;
+    while (pos + 10.0f * RB_ETU <= (float)segN) {
+        int bits[10];
+        for (int nbit = 0; nbit < 10; nbit++) {
+            int c = (int)(pos + (nbit + 0.5f) * RB_ETU);
+            int lo = c - 2; if (lo < 0) lo = 0;
+            int hi = c + 3; if (hi > segN) hi = segN;
+            float s = 0; for (int t = lo; t < hi; t++) s += s_dm_soft[t];
+            bits[nbit] = s > 0 ? 1 : 0;
+        }
+        if (bits[0] != 0 || bits[9] != 1) break;
+        uint8_t byte = 0; for (int n = 0; n < 8; n++) byte |= bits[1 + n] << n;
+        if (len >= out_cap) break;
+        out[len++] = byte;
+        int q = (int)(pos + 10.0f * RB_ETU) - 2;
+        while (q < segN && s_dm_soft[q] > 0) q++;
+        pos = (float)q;
+    }
+    return len;
+}
+
+static uint8_t s_hf14b_rb_out[4096];
+static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    hf14b_bb_params_t p;
+    uint16_t pos = 0;
+    if (length < 19) {                               // 17-byte param block + start + count
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t flags = data[pos++];
+    p.mod_reg = data[pos++];
+    p.hi = data[pos++];
+    p.lo = data[pos++];
+    p.etu_q8 = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.sof_low = data[pos++];
+    p.sof_high = data[pos++];
+    p.eof_low = data[pos++];
+    p.egt = data[pos++];
+    p.rx_mode = data[pos++];
+    p.timeout_ms = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.n_samples = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.sample_reg = data[pos++] & 0x3F;
+
+    if (p.mod_reg < ModeReg || p.mod_reg > TCounterValueRegL || p.etu_q8 < 256 || p.rx_mode != 2 ||
+            p.sof_low > 32 || p.sof_high > 32 || p.eof_low > 32 || p.egt > 32 ||
+            p.n_samples == 0 || p.n_samples > sizeof(s_hf14b_bb_samples)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (p.timeout_ms == 0 || p.timeout_ms > 1000) {
+        p.timeout_ms = DEF_COM_TIMEOUT;
+    }
+
+    uint8_t n_regs = data[pos++];
+    uint16_t regs_pos = pos;
+    if (n_regs > 24 || pos + n_regs * 2 + 2 > length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    for (uint8_t i = 0; i < n_regs; i++) {
+        if (!hf14b_reg_writable(data[regs_pos + i * 2])) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+    }
+    pos += n_regs * 2;
+    if (pos + 2 > length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t start = data[pos++];
+    uint8_t count = data[pos++];
+    if (count == 0) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    if (flags & 0x01) {
+        pcd_14a_reader_reset();
+        pcd_14a_reader_antenna_on();
+        bsp_delay_ms(8);
+    }
+    for (uint8_t i = 0; i < n_regs; i++) {
+        write_register_single(data[regs_pos + i * 2], data[regs_pos + i * 2 + 1]);
+    }
+
+    hf14b_bb_result_t res;
+    uint8_t *o = s_hf14b_rb_out;
+    uint16_t n = 0;
+    float freqCache = 0.0f;                           // subcarrier estimate reused across blocks
+    for (uint8_t k = 0; k < count; k++) {
+        // worst case per block = blk+spi+flag + u16 len + samples
+        if (n + 5u + p.n_samples > sizeof(s_hf14b_rb_out)) {
+            break;                                   // frame full, host re-requests the rest
+        }
+        uint8_t blk = (uint8_t)(start + k);
+        uint8_t frame[4];
+        frame[0] = 0x08;
+        frame[1] = blk;
+        crc14b_append(frame, 2);
+        uint8_t st = pcd_14b_bitbang_transceive(&p, frame, 4, &res, s_hf14b_bb_samples);
+        o[n++] = blk;
+        o[n++] = res.spi_check;
+
+        // Try to decode on-device (CRC-gated). Order matches the host: thr 1.5/1.0, ch Q/I.
+        uint8_t dec[8];
+        uint8_t declen = 0;
+        if (st == STATUS_HF_TAG_OK && res.spi_check == 0x92 && res.n_samples > 0 && res.n_samples <= RB_N) {
+            float fUsed = 0;
+            // Fast path: reuse the cached subcarrier frequency (no per-block search).
+            if (freqCache > 0.0f) {
+                for (int ti = 0; ti < 2 && declen == 0; ti++) {
+                    float thr = (ti == 0) ? 1.5f : 1.0f;
+                    for (uint8_t ch = 0; ch < 2 && declen == 0; ch++) {
+                        uint8_t l = st25_bpsk_decode(s_hf14b_bb_samples, res.n_samples, ch, thr,
+                                                     freqCache, &fUsed, dec, sizeof(dec));
+                        if (l == 6 && crc14b_ok(dec, 6)) declen = 6;
+                    }
+                }
+            }
+            // Slow path: full frequency search; cache the result on success.
+            if (declen == 0) {
+                for (int ti = 0; ti < 2 && declen == 0; ti++) {
+                    float thr = (ti == 0) ? 1.5f : 1.0f;
+                    for (uint8_t ch = 0; ch < 2 && declen == 0; ch++) {
+                        uint8_t l = st25_bpsk_decode(s_hf14b_bb_samples, res.n_samples, ch, thr,
+                                                     0.0f, &fUsed, dec, sizeof(dec));
+                        if (l == 6 && crc14b_ok(dec, 6)) { declen = 6; freqCache = fUsed; }
+                    }
+                }
+            }
+        }
+
+        if (declen == 6) {
+            o[n++] = 1;                              // flag: decoded on device
+            o[n++] = dec[0]; o[n++] = dec[1]; o[n++] = dec[2]; o[n++] = dec[3];
+        } else {
+            o[n++] = 0;                              // flag: raw samples, host demodulates
+            o[n++] = res.n_samples >> 8;
+            o[n++] = res.n_samples & 0xFF;
+            memcpy(&o[n], s_hf14b_bb_samples, res.n_samples);
+            n += res.n_samples;
+        }
+    }
+
+    if (!(flags & 0x02)) {
+        pcd_14a_reader_antenna_off();
+    }
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, n, o);
+}
+
 /**
  * Experimental: on-device sweep looking for register values that "unlock" bits
  * of a target register (e.g. TxModeReg framing bits). For every value a of regA
@@ -3774,6 +4076,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14B_RAW_TEST,                 before_reader_run,           cmd_processor_hf14b_raw_test,                NULL                   },
     {    DATA_CMD_HF14B_BITBANG,                  before_reader_run,           cmd_processor_hf14b_bitbang,                 NULL                   },
     {    DATA_CMD_HF14B_UNLOCK_SCAN,              before_reader_run,           cmd_processor_hf14b_unlock_scan,             NULL                   },
+    {    DATA_CMD_HF14B_READ_BLOCKS,              before_reader_run,           cmd_processor_hf14b_read_blocks,             NULL                   },
     {    DATA_CMD_HF14B_VAULT_SAVE,               NULL,                        cmd_processor_hf14b_vault_save,              NULL                   },
     {    DATA_CMD_HF14B_VAULT_LOAD,               NULL,                        cmd_processor_hf14b_vault_load,              NULL                   },
     {    DATA_CMD_HF14B_VAULT_LIST,               NULL,                        cmd_processor_hf14b_vault_list,              NULL                   },
