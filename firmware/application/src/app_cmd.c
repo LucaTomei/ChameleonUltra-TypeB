@@ -3801,17 +3801,19 @@ static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t s
         frame[0] = 0x08;
         frame[1] = blk;
         crc14b_append(frame, 2);
-        uint8_t st = pcd_14b_bitbang_transceive(&p, frame, 4, &res, s_hf14b_bb_samples);
-        o[n++] = blk;
-        o[n++] = res.spi_check;
-
-        // Try to decode on-device (CRC-gated). Order matches the host: thr 1.5/1.0, ch Q/I.
+        // Read + decode on-device, retrying the RF read up to 3 times before falling back
+        // to shipping raw samples. A fresh read (~1.5 ms) that decodes on-device is far
+        // cheaper than the host re-reading the block over BLE, so this keeps the slow host
+        // fallback down to essentially zero. Order matches the host: thr 1.5/1.0, ch Q/I.
         uint8_t dec[8];
         uint8_t declen = 0;
-        if (st == STATUS_HF_TAG_OK && res.spi_check == 0x92 && res.n_samples > 0 && res.n_samples <= RB_N) {
+        for (int attempt = 0; attempt < 3 && declen == 0; attempt++) {
+            pcd_14b_bitbang_transceive(&p, frame, 4, &res, s_hf14b_bb_samples);
+            if (!(res.spi_check == 0x92 && res.n_samples > 0 && res.n_samples <= RB_N)) {
+                continue;
+            }
             float fUsed = 0;
-            // Fast path 0: the combo that worked on a previous block almost always wins
-            // again — try it alone first so most blocks run a single decode.
+            // The combo that worked on a previous block almost always wins again.
             if (freqCache > 0.0f && winTi >= 0) {
                 float thr = (winTi == 0) ? 1.5f : 1.0f;
                 uint8_t l = st25_bpsk_decode(s_hf14b_bb_samples, res.n_samples, (uint8_t)winCh, thr,
@@ -3829,10 +3831,7 @@ static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t s
                     }
                 }
             }
-            // Slow path (full frequency search) only to ESTABLISH the subcarrier once per
-            // batch. The frequency is stable within a session, so after it is known a block
-            // the cached frequency cannot decode is sent raw for the host to demodulate —
-            // far cheaper than re-running the ~16 ms search on every hard block.
+            // Full frequency search to ESTABLISH the subcarrier once per batch.
             if (declen == 0 && freqCache == 0.0f) {
                 for (int ti = 0; ti < 2 && declen == 0; ti++) {
                     float thr = (ti == 0) ? 1.5f : 1.0f;
@@ -3844,6 +3843,8 @@ static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t s
                 }
             }
         }
+        o[n++] = blk;
+        o[n++] = res.spi_check;
 
         if (declen == 6) {
             o[n++] = 1;                              // flag: decoded on device
