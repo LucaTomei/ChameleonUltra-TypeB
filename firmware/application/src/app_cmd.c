@@ -3608,16 +3608,23 @@ static uint8_t st25_bpsk_decode(const uint8_t *samples, uint16_t ns, uint8_t ch,
         if (v > 7) v -= 16;
         s_dm_sig[i] = (float)v;
     }
-    // 2) active span via sliding RMS (window 12)
+    // 2) active span via sliding RMS (window 12). Incremental running sum/sumsq and a
+    //    squared comparison (rms>thr  <=>  var>thr^2*cnt) avoid recomputing the window and
+    //    the per-sample sqrtf — same result, ~10x less work in this hot loop.
     int first = -1, last = -1;
-    for (uint16_t i = 0; i < ns; i++) {
-        int lo = (int)i - 6; if (lo < 0) lo = 0;
-        int hi = (int)i + 6; if (hi > (int)ns) hi = ns;
-        int cnt = hi - lo;
-        float m = 0; for (int k = lo; k < hi; k++) m += s_dm_sig[k]; m /= cnt;
-        float var = 0; for (int k = lo; k < hi; k++) { float dd = s_dm_sig[k] - m; var += dd * dd; }
-        float rms = sqrtf(var / cnt);
-        if (rms > thr) { if (first < 0) first = i; last = i; }
+    {
+        const float thr2 = thr * thr;
+        float S = 0, Q = 0;          // running sum and sum of squares over [wlo, whi)
+        int wlo = 0, whi = 0;
+        for (uint16_t i = 0; i < ns; i++) {
+            int lo = (int)i - 6; if (lo < 0) lo = 0;
+            int hi = (int)i + 6; if (hi > (int)ns) hi = ns;
+            while (whi < hi) { float v = s_dm_sig[whi]; S += v; Q += v * v; whi++; }   // lo/hi are
+            while (wlo < lo) { float v = s_dm_sig[wlo]; S -= v; Q -= v * v; wlo++; }   // monotonic
+            int cnt = hi - lo;
+            float var = Q - S * S / (float)cnt;
+            if (var > thr2 * (float)cnt) { if (first < 0) first = i; last = i; }
+        }
     }
     if (first < 0) return 0;
     int a = first + 2, b = last;
@@ -3783,6 +3790,7 @@ static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t s
     uint8_t *o = s_hf14b_rb_out;
     uint16_t n = 0;
     float freqCache = 0.0f;                           // subcarrier estimate reused across blocks
+    int winTi = -1, winCh = -1;                       // last winning (threshold, channel) combo
     for (uint8_t k = 0; k < count; k++) {
         // worst case per block = blk+spi+flag + u16 len + samples
         if (n + 5u + p.n_samples > sizeof(s_hf14b_rb_out)) {
@@ -3802,14 +3810,22 @@ static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t s
         uint8_t declen = 0;
         if (st == STATUS_HF_TAG_OK && res.spi_check == 0x92 && res.n_samples > 0 && res.n_samples <= RB_N) {
             float fUsed = 0;
+            // Fast path 0: the combo that worked on a previous block almost always wins
+            // again — try it alone first so most blocks run a single decode.
+            if (freqCache > 0.0f && winTi >= 0) {
+                float thr = (winTi == 0) ? 1.5f : 1.0f;
+                uint8_t l = st25_bpsk_decode(s_hf14b_bb_samples, res.n_samples, (uint8_t)winCh, thr,
+                                             freqCache, &fUsed, dec, sizeof(dec));
+                if (l == 6 && crc14b_ok(dec, 6)) declen = 6;
+            }
             // Fast path: reuse the cached subcarrier frequency (no per-block search).
-            if (freqCache > 0.0f) {
+            if (declen == 0 && freqCache > 0.0f) {
                 for (int ti = 0; ti < 2 && declen == 0; ti++) {
                     float thr = (ti == 0) ? 1.5f : 1.0f;
                     for (uint8_t ch = 0; ch < 2 && declen == 0; ch++) {
                         uint8_t l = st25_bpsk_decode(s_hf14b_bb_samples, res.n_samples, ch, thr,
                                                      freqCache, &fUsed, dec, sizeof(dec));
-                        if (l == 6 && crc14b_ok(dec, 6)) declen = 6;
+                        if (l == 6 && crc14b_ok(dec, 6)) { declen = 6; winTi = ti; winCh = ch; }
                     }
                 }
             }
@@ -3820,7 +3836,7 @@ static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t s
                     for (uint8_t ch = 0; ch < 2 && declen == 0; ch++) {
                         uint8_t l = st25_bpsk_decode(s_hf14b_bb_samples, res.n_samples, ch, thr,
                                                      0.0f, &fUsed, dec, sizeof(dec));
-                        if (l == 6 && crc14b_ok(dec, 6)) { declen = 6; freqCache = fUsed; }
+                        if (l == 6 && crc14b_ok(dec, 6)) { declen = 6; freqCache = fUsed; winTi = ti; winCh = ch; }
                     }
                 }
             }

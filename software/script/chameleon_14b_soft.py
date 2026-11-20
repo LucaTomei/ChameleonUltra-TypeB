@@ -15,6 +15,7 @@ HF14B_BITBANG firmware command:
 """
 import cmath
 import math
+import struct
 import time
 
 US_PER_SAMPLE = 1.0025                      # measured SPIM byte period on nRF52840 @ 8 MHz
@@ -194,6 +195,37 @@ class SoftST25TB:
     def read_block(self, block):
         return self.xfer([0x08, block], 1100, 6)
 
+    def read_batch(self, start, count, n_samples=900):
+        """Read `count` blocks from `start` in one on-device batch (HF14B_READ_BLOCKS,
+        decode on the Chameleon). Returns {block: 4-byte data or None}. Raises on old
+        firmware without the command."""
+        flags = 0x02                                   # keep field, no reset
+        data = struct.pack("!BBBBHBBBBBHHBB", flags, self.mod['mod_reg'], self.mod['hi'], self.mod['lo'],
+                           ETU_Q8, 10, 2, 10, 0, 2, 3, n_samples, 0x3B, 0) + bytes([start, count])
+        resp = self.cmd.device.send_cmd_sync(0x0805, data, timeout=8)   # 2053 = HF14B_READ_BLOCKS
+        d = resp.data                                  # empty on old firmware -> caller falls back
+        out = {}
+        pos = 0
+        while pos + 3 <= len(d):
+            blk = d[pos]; flag = d[pos + 2]; pos += 3
+            if flag == 1:
+                out[blk] = bytes(d[pos:pos + 4]); pos += 4
+            else:
+                if pos + 2 > len(d):
+                    break
+                n = (d[pos] << 8) | d[pos + 1]; pos += 2
+                samples = d[pos:pos + n]; pos += n
+                val = None                             # host-side demod fallback for this block
+                for thr in (1.5, 1.0):
+                    for ch in ("Q", "I"):
+                        dec = bpsk_decode(samples, ch, thr=thr)
+                        if dec and crc_ok(dec) and len(dec) == 6:
+                            val = dec[:-2]; break
+                    if val:
+                        break
+                out[blk] = val
+        return out
+
     def write_block(self, block, data, verify=True, tries=3):
         """
         WRITE_BLOCK (0x09). The tag does not answer, so the result is checked by
@@ -235,13 +267,34 @@ def dump_to_blocks(dump: bytes):
 
 
 def read_blocks(tag, count, progress=None):
-    """Read blocks 0..count-1. Returns a list (None for blocks that could not be read)."""
-    out = []
-    for blk in range(count):
-        data = tag.read_block(blk)
-        out.append(data)
-        if progress:
-            progress(blk, data)
+    """Read blocks 0..count-1. Returns a list (None for blocks that could not be read).
+
+    Uses the on-device batch command (HF14B_READ_BLOCKS, decode on the Chameleon) which
+    is far fewer USB round-trips than reading block by block; falls back to per-block on
+    older firmware or for any block the device could not decode.
+    """
+    out = [None] * count
+    try:
+        b = 0
+        while b < count:
+            got = tag.read_batch(b, min(64, count - b))
+            if not got:
+                break
+            last = b
+            for blk, data in sorted(got.items()):
+                if blk < count:
+                    out[blk] = data
+                    if progress:
+                        progress(blk, data)
+                last = max(last, blk)
+            b = last + 1
+    except Exception:
+        pass                                    # old firmware: fall through to per-block
+    for blk in range(count):                    # fill any gaps (raw/undecoded or no batch)
+        if out[blk] is None:
+            out[blk] = tag.read_block(blk)
+            if progress:
+                progress(blk, out[blk])
     return out
 
 
