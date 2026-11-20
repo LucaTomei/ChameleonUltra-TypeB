@@ -3829,8 +3829,11 @@ static data_frame_tx_t *cmd_processor_hf14b_read_blocks(uint16_t cmd, uint16_t s
                     }
                 }
             }
-            // Slow path: full frequency search; cache the result on success.
-            if (declen == 0) {
+            // Slow path (full frequency search) only to ESTABLISH the subcarrier once per
+            // batch. The frequency is stable within a session, so after it is known a block
+            // the cached frequency cannot decode is sent raw for the host to demodulate —
+            // far cheaper than re-running the ~16 ms search on every hard block.
+            if (declen == 0 && freqCache == 0.0f) {
                 for (int ti = 0; ti < 2 && declen == 0; ti++) {
                     float thr = (ti == 0) ? 1.5f : 1.0f;
                     for (uint8_t ch = 0; ch < 2 && declen == 0; ch++) {
