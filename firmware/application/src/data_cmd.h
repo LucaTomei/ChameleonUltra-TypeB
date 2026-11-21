@@ -131,6 +131,7 @@
 #define DATA_CMD_JABLOTRON_WRITE_TO_T55XX       (3020)
 #define DATA_CMD_PYRAMID_SCAN                   (3021)
 #define DATA_CMD_PCF7931_RAW_SCAN               (3022)  /* PCF7930/7931: capture raw LF edge intervals for host-side demod */
+#define DATA_CMD_T55XX_RAW_SCAN                 (3023)  /* T5577/T55x7 default-read: capture raw LF edge intervals for host-side demod */
 
 //
 // ******************************************************************
