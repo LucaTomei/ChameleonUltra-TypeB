@@ -28,6 +28,9 @@ bool pyramid_read(uint8_t *data, uint32_t timeout_ms);
 
 bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen);
 
+// PCF7930/7931: capture raw falling-edge intervals (carrier cycles) for host-side demod.
+bool pcf7931_read_raw(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen);
+
 #ifdef __cplusplus
 }
 #endif

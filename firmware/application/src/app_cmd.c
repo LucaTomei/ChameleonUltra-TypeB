@@ -1003,6 +1003,39 @@ static data_frame_tx_t *cmd_processor_pac_scan(uint16_t cmd, uint16_t status, ui
     return data_frame_make(cmd, STATUS_LF_TAG_OK, sizeof(card_id), card_id);
 }
 
+// PCF7930/7931: capture raw LF edge intervals and return them for host-side demod.
+// Optional request params (big-endian): [0..1] timeout_ms, [2..3] max intervals.
+#define PCF7931_RAW_LEN 4000
+#define PCF7931_RAW_TIMEOUT_MS 2000
+static data_frame_tx_t *cmd_processor_pcf7931_raw_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t timeout_ms = PCF7931_RAW_TIMEOUT_MS;
+    uint16_t maxlen = PCF7931_RAW_LEN;
+    if (length >= 2) {
+        timeout_ms = ((uint32_t)data[0] << 8) | data[1];
+    }
+    if (length >= 4) {
+        uint16_t m = ((uint16_t)data[2] << 8) | data[3];
+        if (m > 0 && m <= PCF7931_RAW_LEN) {
+            maxlen = m;
+        }
+    }
+    uint8_t *outdata = malloc(maxlen);
+    if (outdata == NULL) {
+        return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
+    }
+    size_t outlen = 0;
+    if (!pcf7931_read_raw(outdata, maxlen, timeout_ms, &outlen)) {
+        free(outdata);
+        return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
+    }
+    data_frame_tx_t *frame = data_frame_make(cmd, STATUS_LF_TAG_OK, outlen, outdata);
+    free(outdata);
+    if (frame == NULL) {
+        return data_frame_make(cmd, STATUS_CREATE_RESPONSE_ERR, 0, NULL);
+    }
+    return frame;
+}
+
 static data_frame_tx_t *cmd_processor_viking_write_to_t55xx(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     typedef struct {
         uint8_t id[4];
@@ -4072,6 +4105,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_JABLOTRON_SCAN,               before_reader_run,           cmd_processor_jablotron_scan,                NULL                   },
     {    DATA_CMD_JABLOTRON_WRITE_TO_T55XX,     before_reader_run,           cmd_processor_jablotron_write_to_t55xx,      NULL                   },
     {    DATA_CMD_PYRAMID_SCAN,                 before_reader_run,           cmd_processor_pyramid_scan,                  NULL                   },
+    {    DATA_CMD_PCF7931_RAW_SCAN,             before_reader_run,           cmd_processor_pcf7931_raw_scan,              NULL                   },
     {    DATA_CMD_IDTECK_WRITE_TO_T55XX,        before_reader_run,           cmd_processor_idteck_write_to_t55xx,         NULL                   },
     {    DATA_CMD_LF_T55XX_WRITE,               before_reader_run,           cmd_processor_lf_t55xx_write,                NULL                   },
     {    DATA_CMD_ADC_GENERIC_READ,             before_reader_run,           cmd_processor_generic_read,                  NULL                   },
