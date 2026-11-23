@@ -1036,6 +1036,19 @@ static data_frame_tx_t *cmd_processor_pcf7931_raw_scan(uint16_t cmd, uint16_t st
     return frame;
 }
 
+// PCF7930/7931 write: request = address(1) · use_pw(1) · password(7) · block data(16).
+static data_frame_tx_t *cmd_processor_pcf7931_write(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 25) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t address = data[0];
+    bool use_pw = data[1] != 0;
+    const uint8_t *pw = &data[2];     // 7 bytes
+    const uint8_t *blk = &data[9];    // 16 bytes
+    bool ok = pcf7931_write_block(address, blk, use_pw, pw);
+    return data_frame_make(cmd, ok ? STATUS_LF_TAG_OK : STATUS_LF_TAG_NO_FOUND, 0, NULL);
+}
+
 // T5577/T55x7 default-read: the tag streams its 32-bit blocks while powered. Capture
 // the raw LF edge intervals (same generic 125 kHz edge capture as PCF7931) and let the
 // host Manchester-demodulate them. Optional params (BE): [0..1] timeout_ms, [2..3] max.
@@ -4140,6 +4153,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_JABLOTRON_WRITE_TO_T55XX,     before_reader_run,           cmd_processor_jablotron_write_to_t55xx,      NULL                   },
     {    DATA_CMD_PYRAMID_SCAN,                 before_reader_run,           cmd_processor_pyramid_scan,                  NULL                   },
     {    DATA_CMD_PCF7931_RAW_SCAN,             before_reader_run,           cmd_processor_pcf7931_raw_scan,              NULL                   },
+    {    DATA_CMD_PCF7931_WRITE,                before_reader_run,           cmd_processor_pcf7931_write,                 NULL                   },
     {    DATA_CMD_T55XX_RAW_SCAN,               before_reader_run,           cmd_processor_t55xx_raw_scan,                NULL                   },
     {    DATA_CMD_IDTECK_WRITE_TO_T55XX,        before_reader_run,           cmd_processor_idteck_write_to_t55xx,         NULL                   },
     {    DATA_CMD_LF_T55XX_WRITE,               before_reader_run,           cmd_processor_lf_t55xx_write,                NULL                   },
