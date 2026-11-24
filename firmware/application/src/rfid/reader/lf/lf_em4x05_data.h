@@ -46,6 +46,8 @@ typedef struct {
 
 bool    em4x05_read(em4x05_data_t *out, uint32_t timeout_ms);
 uint8_t scan_em4x05(em4x05_data_t *out);
+// Prova una password (login EM4x05/EM4x69); true se il chip ACKa → password corretta.
+bool em4x05_try_password(uint32_t password, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

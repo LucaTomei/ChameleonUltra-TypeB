@@ -2338,6 +2338,17 @@ static data_frame_tx_t *cmd_processor_em4x05_scan(uint16_t cmd, uint16_t status,
     return data_frame_make(cmd, STATUS_LF_TAG_OK, sizeof(payload), (uint8_t *)&payload);
 }
 
+// EM4x05/EM4x69: prova una password (login). Payload = 4 byte password (big-endian).
+// Ritorna LF_TAG_OK se il chip ACKa (password corretta), LF_TAG_NO_FOUND altrimenti.
+static data_frame_tx_t *cmd_processor_em4x05_login(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 4) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t pwd = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+    bool ok = em4x05_try_password(pwd, 1000);
+    return data_frame_make(cmd, ok ? STATUS_LF_TAG_OK : STATUS_LF_TAG_NO_FOUND, 0, NULL);
+}
+
 static data_frame_tx_t *cmd_processor_lf_sniff(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     /* Optional 2-byte big-endian timeout in ms from host (default 2000ms) */
     uint32_t timeout_ms = 2000;
@@ -4215,6 +4226,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_IOPROX_DECODE_RAW,            NULL,                        cmd_processor_ioprox_decode_raw,             NULL                   },
     {    DATA_CMD_IOPROX_COMPOSE_ID,            NULL,                        cmd_processor_ioprox_compose_id,             NULL                   },
     {    DATA_CMD_EM4X05_SCAN,                  before_reader_run,           cmd_processor_em4x05_scan,                   NULL                   },
+    {    DATA_CMD_EM4X05_LOGIN,                 before_reader_run,           cmd_processor_em4x05_login,                  NULL                   },
     {    DATA_CMD_LF_SNIFF,                     before_reader_run,           cmd_processor_lf_sniff,                      NULL                   },
     {    DATA_CMD_HF14A_SNIFF,                  NULL,                        cmd_processor_hf14a_sniff,                   NULL                   },
     {    DATA_CMD_HF14A_AUTH_TRACE,             before_hf_reader_run,        cmd_processor_hf14a_auth_trace,              after_hf_reader_run    },
