@@ -1003,9 +1003,16 @@ static data_frame_tx_t *cmd_processor_pac_scan(uint16_t cmd, uint16_t status, ui
     return data_frame_make(cmd, STATUS_LF_TAG_OK, sizeof(card_id), card_id);
 }
 
-// PCF7930/7931: capture raw LF edge intervals and return them for host-side demod.
-// Optional request params (big-endian): [0..1] timeout_ms, [2..3] max intervals.
-#define PCF7931_RAW_LEN 4000
+// PCF7930/7931: capture the raw LF envelope (SAADC) and return it for host-side demod.
+// Il SAADC campiona l'inviluppo a ~125 ksps (1 campione per ciclo portante, 8 µs) con
+// settle antenna di 2 ms: molto meglio della cattura a fronti del comparatore per la
+// modulazione debole del PCF. Un blocco PCF (128 bit) dura ~50 ms → servono molti campioni.
+// Param opzionali (big-endian): [0..1] timeout_ms, [2..3] max campioni.
+// Frame TX max = 4096 byte. Un blocco PCF (128 bit × 64·T0 = ~65 ms) a 125 ksps sarebbe
+// ~8192 campioni: non entra. Si decima (1 su 4) così 4096 campioni coprono ~131 ms ≈ 2
+// blocchi, mantenendo ~8 campioni per simbolo 32·T0 per la demod a soglia sul host.
+#define PCF7931_RAW_LEN 4096
+#define PCF7931_RAW_DECIM 4
 #define PCF7931_RAW_TIMEOUT_MS 2000
 static data_frame_tx_t *cmd_processor_pcf7931_raw_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint32_t timeout_ms = PCF7931_RAW_TIMEOUT_MS;
@@ -1024,7 +1031,7 @@ static data_frame_tx_t *cmd_processor_pcf7931_raw_scan(uint16_t cmd, uint16_t st
         return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
     }
     size_t outlen = 0;
-    if (!pcf7931_read_raw(outdata, maxlen, timeout_ms, &outlen)) {
+    if (!raw_read_to_buffer_decim(outdata, maxlen, timeout_ms, &outlen, PCF7931_RAW_DECIM) || outlen == 0) {
         free(outdata);
         return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
     }
@@ -1050,9 +1057,10 @@ static data_frame_tx_t *cmd_processor_pcf7931_write(uint16_t cmd, uint16_t statu
 }
 
 // T5577/T55x7 default-read: the tag streams its 32-bit blocks while powered. Capture
-// the raw LF edge intervals (same generic 125 kHz edge capture as PCF7931) and let the
-// host Manchester-demodulate them. Optional params (BE): [0..1] timeout_ms, [2..3] max.
-#define T55XX_RAW_LEN 2500
+// the raw LF envelope (SAADC, come PCF7931) e lascia la demodulazione Manchester al host.
+// Param opzionali (BE): [0..1] timeout_ms, [2..3] max campioni.
+#define T55XX_RAW_LEN 4096
+#define T55XX_RAW_DECIM 2
 #define T55XX_RAW_TIMEOUT_MS 1500
 static data_frame_tx_t *cmd_processor_t55xx_raw_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint32_t timeout_ms = T55XX_RAW_TIMEOUT_MS;
@@ -1071,7 +1079,7 @@ static data_frame_tx_t *cmd_processor_t55xx_raw_scan(uint16_t cmd, uint16_t stat
         return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
     }
     size_t outlen = 0;
-    if (!pcf7931_read_raw(outdata, maxlen, timeout_ms, &outlen)) {   // generic edge capture
+    if (!raw_read_to_buffer_decim(outdata, maxlen, timeout_ms, &outlen, T55XX_RAW_DECIM) || outlen == 0) {   // SAADC envelope
         free(outdata);
         return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
     }

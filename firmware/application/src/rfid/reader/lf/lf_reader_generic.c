@@ -40,8 +40,13 @@ static void uninit_saadc_hw(void) {
     lf_125khz_radio_saadc_disable();
 }
 
-bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen) {
+/* Variante con decimazione: tiene 1 campione ogni `decimation` (>=1). Serve ai lettori
+ * a banda lunga (PCF7931, T55xx) dove un blocco dura troppo per entrare nei 4096 byte di
+ * frame a piena frequenza (~125 ksps): decimando si copre più tempo con lo stesso buffer,
+ * mantenendo abbastanza campioni per simbolo per la demodulazione a soglia sul host. */
+bool raw_read_to_buffer_decim(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen, uint8_t decimation) {
     *outlen = 0;
+    if (decimation == 0) decimation = 1;
 
     cb_init(&cb, CIRCULAR_BUFFER_SIZE, sizeof(uint16_t));
     init_saadc_hw();
@@ -52,10 +57,12 @@ bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_
      * another ~800µs to reach steady state. Skip 2ms to be safe. */
     bsp_delay_ms(2);
 
+    uint32_t seen = 0;
     autotimer *p_at = bsp_obtain_timer(0);
     while (NO_TIMEOUT_1MS(p_at, timeout_ms) && *outlen < maxlen) {
         uint16_t val = 0;
         while (cb_pop_front(&cb, &val) && *outlen < maxlen) {
+            if ((seen++ % decimation) != 0) continue;  /* decima */
             val = val >> 5;  /* 14-bit ADC → 9-bit, then >>5 gives 8-bit */
             data[*outlen] = val > 0xff ? 0xff : (uint8_t)val;
             ++(*outlen);
@@ -69,4 +76,8 @@ bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_
     cb_free(&cb);
 
     return true;
+}
+
+bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen) {
+    return raw_read_to_buffer_decim(data, maxlen, timeout_ms, outlen, 1);
 }
