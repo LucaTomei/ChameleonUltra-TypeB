@@ -53,9 +53,11 @@ typedef struct {
  * This configuration can be preserved by persistently to Flash
  * 4 bytes a word, keep in mind the entire word alignment
  */
-#define TAG_SLOT_CONFIG_CURRENT_VERSION 8
-// Intended struct size, for static assert
-#define TAG_SLOT_CONFIG_CURRENT_SIZE 68
+#define TAG_SLOT_CONFIG_CURRENT_VERSION 9
+// Intended struct size, for static assert.
+// header 4B (version+active_slot+align) + TAG_MAX_SLOT_NUM × 8B per slot.
+// 8 slot = 68, 16 slot = 132.
+#define TAG_SLOT_CONFIG_CURRENT_SIZE (4 + TAG_MAX_SLOT_NUM * 8)
 
 typedef struct {
     // Basic configuration

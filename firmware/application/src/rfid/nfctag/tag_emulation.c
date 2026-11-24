@@ -449,7 +449,9 @@ static void tag_emulation_migrate_slot_config_v0_to_v8(void) {
     // Populate new slotConfig struct
     slotConfig.version = TAG_SLOT_CONFIG_CURRENT_VERSION;
     slotConfig.active_slot = tmpbuf[0];
-    for (uint8_t i = 0; i < ARRAYLEN(slotConfig.slots); i++) {
+    // Il formato pre-v8 aveva 8 slot (4 byte ciascuno). Migra solo quelli; gli slot 8..15
+    // (firmware 16-slot) sono poi azzerati da tag_emulation_migrate_slot_config_v8_to_v9().
+    for (uint8_t i = 0; i < 8; i++) {
         bool enabled = tmpbuf[4 + (i * 4)] & 1;
 
         slotConfig.slots[i].tag_hf = tmpbuf[4 + (i * 4) + 2];
@@ -472,6 +474,19 @@ static void tag_emulation_migrate_slot_config_v0_to_v8(void) {
     }
 }
 
+// v8 -> v9: il firmware passa da 8 a 16 slot. Gli slot 0..7 letti dal vecchio record (stessa
+// struttura per-slot) restano; gli slot 8..15 vengono inizializzati vuoti/disabilitati.
+static void tag_emulation_migrate_slot_config_v8_to_v9(void) {
+    NRF_LOG_INFO("Migrating slotConfig v8 -> v9 (8 -> 16 slot)");
+    for (uint8_t i = 8; i < ARRAYLEN(slotConfig.slots); i++) {
+        slotConfig.slots[i].enabled_hf = false;
+        slotConfig.slots[i].enabled_lf = false;
+        slotConfig.slots[i].tag_hf = TAG_TYPE_UNDEFINED;
+        slotConfig.slots[i].tag_lf = TAG_TYPE_UNDEFINED;
+    }
+    slotConfig.version = TAG_SLOT_CONFIG_CURRENT_VERSION;
+}
+
 static void tag_emulation_migrate_slot_config(void) {
     switch (slotConfig.version) {
         case 0:
@@ -483,6 +498,9 @@ static void tag_emulation_migrate_slot_config(void) {
         case 6:
         case 7:
             tag_emulation_migrate_slot_config_v0_to_v8();
+
+        case 8:
+            tag_emulation_migrate_slot_config_v8_to_v9();
 
             /*
              * Add new migration steps ABOVE THIS COMMENT
