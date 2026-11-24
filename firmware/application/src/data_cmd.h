@@ -133,6 +133,7 @@
 #define DATA_CMD_PCF7931_RAW_SCAN               (3022)  /* PCF7930/7931: capture raw LF edge intervals for host-side demod */
 #define DATA_CMD_T55XX_RAW_SCAN                 (3023)  /* T5577/T55x7 default-read: capture raw LF edge intervals for host-side demod */
 #define DATA_CMD_PCF7931_WRITE                  (3024)  /* PCF7930/7931: write one 128-bit block (optional 56-bit password) */
+#define DATA_CMD_LF_RAW_SCAN                    (3033)  /* LF generico: cattura inviluppo SAADC (timeout, maxlen, decimazione) per demod host (Indala/AWID/FDX-B/...) */
 
 //
 // ******************************************************************

@@ -1091,6 +1091,44 @@ static data_frame_tx_t *cmd_processor_t55xx_raw_scan(uint16_t cmd, uint16_t stat
     return frame;
 }
 
+// LF generico: cattura l'inviluppo SAADC e lo restituisce per la demod host (Indala, AWID,
+// Paradox, FDX-B, ecc.). Param opzionali (big-endian): [0..1] timeout_ms, [2..3] max
+// campioni (cap 4096 = frame TX max), [4] decimazione (1 = piena frequenza ~125 ksps).
+#define LF_RAW_SCAN_LEN 4096
+#define LF_RAW_SCAN_TIMEOUT_MS 1000
+static data_frame_tx_t *cmd_processor_lf_raw_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t timeout_ms = LF_RAW_SCAN_TIMEOUT_MS;
+    uint16_t maxlen = LF_RAW_SCAN_LEN;
+    uint8_t decim = 1;
+    if (length >= 2) {
+        timeout_ms = ((uint32_t)data[0] << 8) | data[1];
+    }
+    if (length >= 4) {
+        uint16_t m = ((uint16_t)data[2] << 8) | data[3];
+        if (m > 0 && m <= LF_RAW_SCAN_LEN) {
+            maxlen = m;
+        }
+    }
+    if (length >= 5 && data[4] > 0) {
+        decim = data[4];
+    }
+    uint8_t *outdata = malloc(maxlen);
+    if (outdata == NULL) {
+        return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
+    }
+    size_t outlen = 0;
+    if (!raw_read_to_buffer_decim(outdata, maxlen, timeout_ms, &outlen, decim) || outlen == 0) {
+        free(outdata);
+        return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
+    }
+    data_frame_tx_t *frame = data_frame_make(cmd, STATUS_LF_TAG_OK, outlen, outdata);
+    free(outdata);
+    if (frame == NULL) {
+        return data_frame_make(cmd, STATUS_CREATE_RESPONSE_ERR, 0, NULL);
+    }
+    return frame;
+}
+
 static data_frame_tx_t *cmd_processor_viking_write_to_t55xx(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     typedef struct {
         uint8_t id[4];
@@ -4163,6 +4201,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_PCF7931_RAW_SCAN,             before_reader_run,           cmd_processor_pcf7931_raw_scan,              NULL                   },
     {    DATA_CMD_PCF7931_WRITE,                before_reader_run,           cmd_processor_pcf7931_write,                 NULL                   },
     {    DATA_CMD_T55XX_RAW_SCAN,               before_reader_run,           cmd_processor_t55xx_raw_scan,                NULL                   },
+    {    DATA_CMD_LF_RAW_SCAN,                  before_reader_run,           cmd_processor_lf_raw_scan,                   NULL                   },
     {    DATA_CMD_IDTECK_WRITE_TO_T55XX,        before_reader_run,           cmd_processor_idteck_write_to_t55xx,         NULL                   },
     {    DATA_CMD_LF_T55XX_WRITE,               before_reader_run,           cmd_processor_lf_t55xx_write,                NULL                   },
     {    DATA_CMD_ADC_GENERIC_READ,             before_reader_run,           cmd_processor_generic_read,                  NULL                   },
