@@ -51,6 +51,13 @@
 #define DATA_CMD_GET_LONG_PRESS_THRESHOLD       (1041)
 #define DATA_CMD_SET_LONG_PRESS_THRESHOLD       (1042)
 #define DATA_CMD_GET_BATTERY_INFO_EX            (1043)
+// Field-triggered slot polling + A+B reboot (16-slot firmware). interval uint16 BE, 100..5000 ms.
+#define DATA_CMD_GET_POLLING_ENABLE             (1044)
+#define DATA_CMD_SET_POLLING_ENABLE             (1045)
+#define DATA_CMD_GET_POLLING_INTERVAL           (1046)
+#define DATA_CMD_SET_POLLING_INTERVAL           (1047)
+#define DATA_CMD_GET_AB_REBOOT_ENABLE           (1048)
+#define DATA_CMD_SET_AB_REBOOT_ENABLE           (1049)
 
 //
 // ******************************************************************

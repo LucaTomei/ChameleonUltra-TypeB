@@ -9,8 +9,16 @@
 #include "tag_base_type.h"
 #include "utils.h"
 
-// Up to eight card slots
-#define TAG_MAX_SLOT_NUM 8
+// Card slots. Bumped 8 -> 16 (Mazha0309-style 16-slot firmware).
+// DA VALIDARE SU DEVICE: questo macro dimensiona gli array di config slot e i record FDS.
+//  - Verificare che la config slot salvata (8 slot) migri senza corrompere i dati: slot 1-8
+//    mantenuti, slot 9-16 inizializzati vuoti (vedi tag_persistence / slot config load).
+//  - Verificare i range FDS: FDS_SLOT_TAG_DUMP_FILE_ID_BASE (0x1100) e NICK (0x1200) devono
+//    avere 16 ID liberi ciascuno.
+//  - GET_SLOT_INFO / GET_ENABLED_SLOTS iterano su TAG_MAX_SLOT_NUM (ok), ma il buffer nick
+//    in app_cmd.c (TAG_MAX_SLOT_NUM * 2 * 37) ora è ~1.2 KB: controllare l'uso di stack.
+//  - LED: 16 slot su 8 LED fisici → mappare con (slot % 8).
+#define TAG_MAX_SLOT_NUM 16
 
 extern bool g_is_tag_emulating;
 

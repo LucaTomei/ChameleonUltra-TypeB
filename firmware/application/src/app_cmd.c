@@ -277,6 +277,49 @@ static data_frame_tx_t *cmd_processor_set_long_press_threshold(uint16_t cmd, uin
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
+// ---- Field-triggered slot polling + A+B reboot (16-slot firmware) ----
+
+static data_frame_tx_t *cmd_processor_get_polling_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status; (void)length; (void)data;
+    uint8_t resp = settings_get_polling_enable() ? 1 : 0;
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &resp);
+}
+
+static data_frame_tx_t *cmd_processor_set_polling_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status;
+    if (length != 1) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    settings_set_polling_enable(data[0] != 0);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_get_polling_interval(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status; (void)length; (void)data;
+    uint16_t ms = settings_get_polling_interval();
+    uint8_t resp[2] = { (uint8_t)(ms >> 8), (uint8_t)(ms & 0xFF) };   // big-endian
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(resp), resp);
+}
+
+static data_frame_tx_t *cmd_processor_set_polling_interval(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status;
+    if (length != 2) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    uint16_t ms = ((uint16_t)data[0] << 8) | data[1];
+    settings_set_polling_interval(ms);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_get_ab_reboot_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status; (void)length; (void)data;
+    uint8_t resp = settings_get_ab_reboot_enable() ? 1 : 0;
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &resp);
+}
+
+static data_frame_tx_t *cmd_processor_set_ab_reboot_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status;
+    if (length != 1) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    settings_set_ab_reboot_enable(data[0] != 0);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
 static data_frame_tx_t *cmd_processor_hf14a_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -4113,6 +4156,12 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },
     {    DATA_CMD_GET_LONG_PRESS_THRESHOLD,     NULL,                        cmd_processor_get_long_press_threshold,      NULL                   },
     {    DATA_CMD_SET_LONG_PRESS_THRESHOLD,     NULL,                        cmd_processor_set_long_press_threshold,      NULL                   },
+    {    DATA_CMD_GET_POLLING_ENABLE,           NULL,                        cmd_processor_get_polling_enable,            NULL                   },
+    {    DATA_CMD_SET_POLLING_ENABLE,           NULL,                        cmd_processor_set_polling_enable,            NULL                   },
+    {    DATA_CMD_GET_POLLING_INTERVAL,         NULL,                        cmd_processor_get_polling_interval,          NULL                   },
+    {    DATA_CMD_SET_POLLING_INTERVAL,         NULL,                        cmd_processor_set_polling_interval,          NULL                   },
+    {    DATA_CMD_GET_AB_REBOOT_ENABLE,         NULL,                        cmd_processor_get_ab_reboot_enable,          NULL                   },
+    {    DATA_CMD_SET_AB_REBOOT_ENABLE,         NULL,                        cmd_processor_set_ab_reboot_enable,          NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 

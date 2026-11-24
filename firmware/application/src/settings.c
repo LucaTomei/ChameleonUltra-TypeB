@@ -58,6 +58,13 @@ void settings_init_sleep_timeout_config(void) {
     config.sleep_timeout = SETTINGS_SLEEP_TIMEOUT_DEFAULT_S;
 }
 
+// add on version8: field polling + A+B reboot
+void settings_init_polling_config(void) {
+    config.polling_enable = false;
+    config.ab_reboot_enable = true;
+    config.polling_interval_ms = SETTINGS_POLLING_INTERVAL_DEFAULT_MS;
+}
+
 // add on version7
 void settings_init_long_press_threshold_config(void) {
     config.long_press_threshold = SETTINGS_LONG_PRESS_THRESHOLD_DEFAULT_MS;
@@ -72,6 +79,7 @@ void settings_init_config(void) {
     settings_init_ble_pairing_enable_config();
     settings_init_sleep_timeout_config();
     settings_init_long_press_threshold_config();
+    settings_init_polling_config();
 }
 
 void settings_migrate(void) {
@@ -97,6 +105,9 @@ void settings_migrate(void) {
 
         case 6:
             settings_init_long_press_threshold_config();
+
+        case 7:
+            settings_init_polling_config();
 
             /*
              * Add new migration steps ABOVE THIS COMMENT
@@ -327,4 +338,31 @@ void settings_set_long_press_threshold(uint16_t duration) {
         duration = SETTINGS_LONG_PRESS_THRESHOLD_MIN_MS;
     }
     config.long_press_threshold = duration;
+}
+
+// add on version8: field polling + A+B reboot
+bool settings_get_polling_enable(void) {
+    return config.polling_enable;
+}
+
+void settings_set_polling_enable(bool enable) {
+    config.polling_enable = enable;
+}
+
+uint16_t settings_get_polling_interval(void) {
+    return config.polling_interval_ms;
+}
+
+void settings_set_polling_interval(uint16_t ms) {
+    if (ms < SETTINGS_POLLING_INTERVAL_MIN_MS) ms = SETTINGS_POLLING_INTERVAL_MIN_MS;
+    if (ms > SETTINGS_POLLING_INTERVAL_MAX_MS) ms = SETTINGS_POLLING_INTERVAL_MAX_MS;
+    config.polling_interval_ms = ms;
+}
+
+bool settings_get_ab_reboot_enable(void) {
+    return config.ab_reboot_enable;
+}
+
+void settings_set_ab_reboot_enable(bool enable) {
+    config.ab_reboot_enable = enable;
 }

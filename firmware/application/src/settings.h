@@ -5,7 +5,10 @@
 
 #include "utils.h"
 
-#define SETTINGS_CURRENT_VERSION 7
+#define SETTINGS_CURRENT_VERSION 8
+#define SETTINGS_POLLING_INTERVAL_DEFAULT_MS 500
+#define SETTINGS_POLLING_INTERVAL_MIN_MS      100
+#define SETTINGS_POLLING_INTERVAL_MAX_MS      5000
 #define SETTINGS_SLEEP_TIMEOUT_DEFAULT_S 8   // default wake timeout in seconds (matches SLEEP_DELAY_MS_BUTTON_WAKEUP)
 #define SETTINGS_SLEEP_TIMEOUT_MIN_S      5
 #define SETTINGS_SLEEP_TIMEOUT_MAX_S      60
@@ -43,7 +46,9 @@ typedef struct ALIGN_U32 {
     // 1 byte
     uint8_t animation_config : 2;
     uint8_t ble_pairing_enable : 1;
-    uint8_t reserved0 : 5; // If you are add switch field, reallocating me.
+    uint8_t polling_enable : 1;   // (add on version8) field-triggered slot polling on/off
+    uint8_t ab_reboot_enable : 1; // (add on version8) A+B long hold soft-reboot on/off
+    uint8_t reserved0 : 3; // If you are add switch field, reallocating me.
 
     // 1 byte
     uint8_t button_a_press : 4;
@@ -61,6 +66,9 @@ typedef struct ALIGN_U32 {
 
     // 2 bytes (add on version7)
     uint16_t long_press_threshold; // long button press threshold in ms
+
+    // 2 bytes (add on version8)
+    uint16_t polling_interval_ms; // field-triggered slot polling interval (100..5000 ms)
 
     /*
      * Warning !!!!!!!!!!!!!!!!!!!!!! <-------------
@@ -92,4 +100,12 @@ void settings_init_sleep_timeout_config(void);
 uint16_t settings_get_long_press_threshold(void);
 void settings_set_long_press_threshold(uint16_t duration);
 void settings_init_long_press_threshold_config(void);
+// add on version8: field polling + A+B reboot
+void settings_init_polling_config(void);
+bool settings_get_polling_enable(void);
+void settings_set_polling_enable(bool enable);
+uint16_t settings_get_polling_interval(void);
+void settings_set_polling_interval(uint16_t ms);
+bool settings_get_ab_reboot_enable(void);
+void settings_set_ab_reboot_enable(bool enable);
 #endif
