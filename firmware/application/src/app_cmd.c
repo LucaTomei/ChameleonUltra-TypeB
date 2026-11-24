@@ -14,6 +14,7 @@
 #include "tag_persistence.h"
 #include "nrf_pwr_mgmt.h"
 #include "settings.h"
+#include "st25tb_emu.h"
 #include "delayed_reset.h"
 #include "netdata.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -3482,6 +3483,19 @@ static data_frame_tx_t *cmd_processor_hf14b_raw_test(uint16_t cmd, uint16_t stat
  */
 static uint8_t s_hf14b_bb_samples[2048];
 static uint8_t s_hf14b_bb_out[32 + 64 + 2048];
+// SPERIMENTALE: carica un dump ST25TB nell'emulatore NFC-B.
+// payload: uid(8) | nblocks(1) | system(4) | blocks(nblocks*4)
+static data_frame_tx_t *cmd_processor_st25tb_emu_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status;
+    if (length < 13) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    uint8_t nblocks = data[8];
+    if (nblocks > ST25TB_EMU_MAX_BLOCKS) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    uint16_t need = 8 + 1 + ST25TB_EMU_BLOCK_SIZE + (uint16_t)nblocks * ST25TB_EMU_BLOCK_SIZE;
+    if (length < need) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    st25tb_emu_load(&data[0], &data[9], &data[13], nblocks);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 static data_frame_tx_t *cmd_processor_hf14b_bitbang(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     hf14b_bb_params_t p;
     hf14b_bb_result_t res;
@@ -4300,6 +4314,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     /* experimental ISO14443-B test: no automatic reset, field handled by request flags */
     {    DATA_CMD_HF14B_RAW_TEST,                 before_reader_run,           cmd_processor_hf14b_raw_test,                NULL                   },
     {    DATA_CMD_HF14B_BITBANG,                  before_reader_run,           cmd_processor_hf14b_bitbang,                 NULL                   },
+    {    DATA_CMD_ST25TB_EMU_SET,                 NULL,                        cmd_processor_st25tb_emu_set,                NULL                   },
     {    DATA_CMD_HF14B_UNLOCK_SCAN,              before_reader_run,           cmd_processor_hf14b_unlock_scan,             NULL                   },
     {    DATA_CMD_HF14B_READ_BLOCKS,              before_reader_run,           cmd_processor_hf14b_read_blocks,             NULL                   },
     {    DATA_CMD_HF14B_TEAROFF,                  before_reader_run,           cmd_processor_hf14b_tearoff,                 NULL                   },
