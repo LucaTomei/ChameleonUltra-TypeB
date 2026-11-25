@@ -1,4 +1,5 @@
 #include "tag_persistence.h"
+#include "tag_emulation.h"   // TAG_MAX_SLOT_NUM
 
 #include "fds_ids.h"
 
@@ -9,8 +10,8 @@
 NRF_LOG_MODULE_REGISTER();
 
 static void get_fds_map_by_slot_auto_inc_id(uint16_t id, uint8_t slot, tag_sense_type_t sense_type, fds_slot_record_map_t *map) {
-    if ((sense_type == TAG_SENSE_NO) || (slot > 7)) {
-        APP_ERROR_CHECK(NRF_ERROR_INVALID_PARAM);
+    if ((sense_type == TAG_SENSE_NO) || (slot >= TAG_MAX_SLOT_NUM)) {
+        APP_ERROR_CHECK(NRF_ERROR_INVALID_PARAM);   // was hardcoded to 7 (8-slot era) → crashed slots 8..15
     }
     map->id = id + slot;
     map->key = sense_type;
