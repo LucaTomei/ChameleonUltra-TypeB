@@ -758,7 +758,11 @@ bool nfc_st25tb_radio_poll(bool *field_present, bool active) {
         if (nrfx_power_usbstatus_get() == NRFX_POWER_USB_STATE_DISCONNECTED) {
             window_us = active ? STB_ACTIVE_WINDOW_US : STB_IDLE_WINDOW_US;
         } else if (usb_hfclk_active()) {
-            window_us = STB_USB_WINDOW_US;
+            // USB plugged in: keep SHORT windows while merely sensing (so USB/BLE stay responsive),
+            // but once a reader is actively transacting (`active`), give it the LONG window too —
+            // otherwise a full ST25TB read (Initiate+Select+Get_UID+16 blocks) does not fit in the
+            // 0.5 s USB window and the reader shows "don't move" forever when the cable is attached.
+            window_us = active ? STB_ACTIVE_WINDOW_US : STB_USB_WINDOW_US;
         }
     }
     bool granted = ready && rf_timeslot_run(window_us, true, paused, stb_window);
