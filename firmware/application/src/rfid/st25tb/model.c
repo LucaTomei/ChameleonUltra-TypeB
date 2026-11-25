@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 /* ST25TB / SRI model, 512-bit (16 blocks) and 4K (128 blocks).
- * RF writes affect RAM only (not persisted to flash). All data blocks are writable so a reader that
- * updates a block sees its new value on read-back, like the real card; the low blocks keep the
- * 512-bit lock/OTP + count-down-counter semantics, while a 4K's high blocks (16..127) are plain
- * writable EEPROM (the 4K's own per-block lock bits are not modelled — a fidelity limit, not a read
- * or clone problem). The inventory Chip_ID (image tail byte) is the anticollision slot id, not the
- * card type: a reader derives 512 vs 4K from the UID product code (image[5]), so Chip_ID 0 is fine. */
+ * RF writes affect RAM only (not persisted to flash), but reproduce the real chip's write rules so a
+ * reader that updates the tag sees exactly what a genuine ST25TB/SRIX would do:
+ *   - blocks 0..4   : OTP area — a Write_block can only program bits 1->0, never 0->1;
+ *   - blocks 5,6    : 32-bit count-down counters — a write is accepted only if it DECREASES;
+ *   - blocks 7..15  : lockable via the OTP_Lock_Reg in the system block (bits b24..b31, ACTIVE LOW,
+ *                     i.e. 0 = locked; b24 locks blocks 7 AND 8, b25->9, b26->10, ... b31->15) —
+ *                     a locked block refuses writes;
+ *   - blocks 16..127: 4K only — plain writable EEPROM (SRIX4K/ST25TB04K lock only 7..15);
+ *   - block 255     : system block / OTP_Lock_Reg — its lock bits are OTP too (1->0 only).
+ * The inventory Chip_ID (image tail byte) is the anticollision slot id, not the card type: a reader
+ * derives 512 vs 4K from the UID product code (image[5]), so Chip_ID 0 is fine. */
 #include "model.h"
 #include "iso15693/frame.h"
 #include <string.h>
@@ -15,7 +20,6 @@ static uint8_t image[ST25TB_IMAGE_MAX];
 static unsigned num_blocks;      /* 16 (512-bit) or 128 (4K) */
 static unsigned img_size;        /* 77 or 525 */
 static state_t state;
-static uint32_t active_locks;
 static bool loaded;
 
 static uint32_t read32(const uint8_t *p) {
@@ -51,7 +55,6 @@ bool st25tb_load(const uint8_t *data, unsigned image_bytes) {
     img_size = image_bytes;
     memcpy(image, data, image_bytes);
     state = READY;
-    active_locks = read32(image + sys_off()) >> 16;
     loaded = true;
     return true;
 }
@@ -66,15 +69,25 @@ static void write_block(unsigned address, const uint8_t *data) {
     }
     if (address >= num_blocks) return;                 /* out of range for this chip */
     uint8_t *block = image + 8 + 4 * address;
+    /* Blocks 0..4 are OTP: a normal Write_block can only program bits to 0, never back to 1 (a bit
+     * already 1 may be cleared; a 0 stays 0). The real chip rejects a 0->1 transition here. */
+    if (address <= 4) {
+        uint32_t merged = read32(block) & value;
+        for (unsigned b = 0; b < 4; b++) block[b] = merged >> (8 * b);
+        return;
+    }
     /* Count-down counters (blocks 5 and 6) accept a write only if it decreases the value. */
     if (address == 5 || address == 6) {
         if (value < read32(block)) memcpy(block, data, 4);
         return;
     }
-    /* A locked low block is write-protected (ST25TB OTP/lock area). Every other data block —
-     * including all of a 4K's high blocks (16..127) — is writable, so a reader that updates a
-     * block (e.g. a counter/balance) sees its value on read-back, like the real card. */
-    if (address < 16 && (active_locks & (1u << address))) return;
+    /* Blocks 7..15 are lockable via the OTP_Lock_Reg in the system block (bits b24..b31, ACTIVE LOW:
+     * 0 = locked). b24 locks BOTH block 7 and 8; b25->9, b26->10, ... b31->15. A locked block refuses
+     * writes, like the real card. Blocks 16..127 (4K) are plain writable EEPROM (not lockable). */
+    if (address >= 7 && address <= 15) {
+        unsigned bit = (address <= 8) ? 24u : (24u + (address - 8u));
+        if (!(read32(image + sys_off()) & (1u << bit))) return;   /* bit 0 -> write-protected */
+    }
     memcpy(block, data, 4);
 }
 
@@ -97,7 +110,6 @@ unsigned st25tb_reply(const uint8_t *frame, unsigned length,
     } else if (payload == 2 && command == 0x0e) {
         if (frame[1] == chip && (state == INVENTORY || state == SELECTED || state == DESELECTED)) {
             state = SELECTED;
-            active_locks = read32(image + sys_off()) >> 16;
             reply[n++] = chip;
         } else if (state == SELECTED && frame[1] != chip) {
             state = DESELECTED;
