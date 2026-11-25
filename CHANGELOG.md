@@ -4,6 +4,13 @@ This project uses the changelog in accordance with [keepchangelog](http://keepac
 
 ## [unreleased][unreleased]
 
+## [v2.4.0-typeb.1][2026-11-25]
+ - **Emulazione a 16 slot con polling su campo**: migrazione config v8→v9, i client vedono tutti i 16 slot (fix `GET_SLOT_INFO`/`GET_ENABLED_SLOTS` e dell'FDS per gli slot 8-15), `nfc_poll` che cicla gli slot abilitati quando un lettore porta il campo (stop-on-select), LED slot attivo, comandi polling/A+B reboot. Ispirato a Mazha0309 (vedi `docs/CREDITS.md`).
+ - **Emulazione ST25TB512-AT / SRI512 (NFC-B)**: il Chameleon fa da tag ISO14443-B e risponde a un lettore (risposta BPSK 847,5 kHz bit-bang su `HF_ANT_SEL`, RX dall'ADC del RC522 via SPIM3/DMA, dentro radio-timeslot SoftDevice). Sottosistema RF **vendorizzato da [SecLabz/ChameleonUnleashed](https://github.com/SecLabz/ChameleonUnleashed)** (GPL-3.0, vedi `docs/CREDITS.md`). Validato col Flipper Zero: legge l'ST25TB emulato (UID e blocchi caricati via comando 2064, immagine 77 byte). Solo la variante ST25TB512-AT. La lettura/scrittura ST25TB (reader) resta invariata.
+ - **LF**: lettura PCF7930/7931 e T55xx via cattura inviluppo SAADC + demod lato host; comando generico `LF_RAW_SCAN` (3033) e `EM4X05_LOGIN` (3034) per attacco a dizionario; scrittura PCF7931 (downlink, **timing da calibrare su hardware**).
+ - Tooling build/flash firmware su macOS (vedi `firmware/BUILD_FLASH_MACOS.md`, `firmware/PCF7931_STATUS.md`).
+ - Note oneste: emulazione ST25TB solo ST25TB512-AT; scrittura PCF7931 e demod T55xx non ancora calibrate su carte reali; il completamento di una lettura durante il polling dipende dal lettore (un lettore a transazione singola funziona meglio di uno a polling continuo).
+
 ## [v2.3.1][2026-11-21]
  - BLE: tighter connection interval (15-30ms, was 20-75) and faster first parameter update for much higher throughput on bulk reads
  - Fix reset when BLE bonds are deleted while connected (@mfcarroll)
