@@ -45,6 +45,8 @@ static void watch_field(void) {
     }
     nrf_gpio_cfg_output(HF_ANT_SEL);
     nrf_gpio_pin_set(HF_ANT_SEL);
+    nrfx_nfct_uninit();   // release any prior owner (nfc_14a) so our init + autocolres_disable takes;
+                          // otherwise the NFCT stays in Type-A auto-collision mode (reader sees 14443-A UID 0)
     nrfx_nfct_config_t config = {.rxtx_int_mask = 0, .cb = field_event};
     if (nrfx_nfct_init(&config) != NRFX_SUCCESS) {
         return;

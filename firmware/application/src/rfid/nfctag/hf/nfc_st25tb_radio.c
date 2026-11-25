@@ -26,8 +26,13 @@
  * we don't). First version: do NOT pause BLE advertising (the SoftDevice radio timeslot already
  * negotiates coexistence); run short fixed timeslot windows. If RF timing later needs longer
  * windows, wire a real advertising pause/resume here. --- */
-static inline bool advertising_pause(bool *resume) { *resume = false; return false; }
-static inline bool usb_hfclk_active(void) { return false; }
+/* Return "paused" = true to unlock the longer RF listening windows (a full ST25TB read of
+ * Initiate+Select+blocks does not fit in the 25ms default window → the reader loses the tag
+ * mid-read). We do NOT actually stop BLE advertising (resume=false): the SoftDevice radio
+ * timeslot already owns the radio for the window's duration. usb_hfclk_active()=true selects the
+ * 0.5s USB-present window (enough for a full read while attached over USB). */
+static inline bool advertising_pause(bool *resume) { *resume = false; return true; }
+static inline bool usb_hfclk_active(void) { return true; }
 
 #define STB_BATCH 128u
 #define STB_MIN_BATCH_BYTES 32u
