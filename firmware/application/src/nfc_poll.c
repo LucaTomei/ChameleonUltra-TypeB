@@ -13,10 +13,17 @@ static uint8_t  m_cursor        = 0;      // slot currently shown while polling
 static uint32_t m_last_switch   = 0;      // timestamp of the last slot advance
 static bool     m_selected      = false;  // the reader selected the current slot → stop cycling
 static bool     m_restore_pending = false; // field left → restore the saved slot from the main loop
+static uint16_t m_advance_budget = 0;     // advances left before we give up cycling (see tick)
 
 // Is this slot usable for polling (HF or LF sense enabled)?
 static bool slot_usable(uint8_t slot) {
     return is_slot_enabled(slot, TAG_SENSE_HF) || is_slot_enabled(slot, TAG_SENSE_LF);
+}
+
+static uint8_t usable_slot_count(void) {
+    uint8_t n = 0;
+    for (uint8_t s = 0; s < TAG_MAX_SLOT_NUM; s++) if (slot_usable(s)) n++;
+    return n;
 }
 
 // Next enabled slot after `from` (wraps). Returns `from` if none other is enabled.
@@ -52,6 +59,11 @@ void nfc_poll_on_field(bool present) {
         m_cursor = tag_emulation_get_slot();
         m_last_switch = 0;   // allow the first advance immediately on the next tick
         m_selected = false;  // new field session: cycle until the reader selects a slot
+        // Budget: at most ~2 full sweeps of the usable slots before giving up (see tick). Bounds
+        // the "rotate forever" case when a field-loss notification is missed (e.g. the field was LF
+        // but we rotated onto an HF slot, so LPCOMP was off and never reported the drop).
+        uint8_t usable = usable_slot_count();
+        m_advance_budget = (usable > 1) ? (uint16_t)usable * 2 : 1;
     } else {
         // Field left. NB: this runs in the NFCT FIELD_LOST interrupt — do NOT change slots here,
         // because tag_emulation_change_slot() may fds_write_sync() and block waiting for FDS events
@@ -83,6 +95,18 @@ void nfc_poll_tick(uint32_t now_ms) {
     if (!m_field_present || m_selected) return;
     uint16_t interval = settings_get_polling_interval();
     if (m_last_switch != 0 && (now_ms - m_last_switch) < interval) return;
+    // Give up after the budget runs out without a selection: a field-loss notification was likely
+    // missed (sense of the lost field not armed on the current slot). Restore the ORIGINAL slot and
+    // park there — this re-arms that slot's own sense, so a later real field change is seen again.
+    if (m_advance_budget == 0) {
+        if (tag_emulation_get_slot() != m_saved_slot) tag_emulation_change_slot(m_saved_slot, true);
+        m_cursor = m_saved_slot;
+        m_selected = true;   // stop cycling until the field drops or a reader selects a slot
+        m_last_switch = now_ms;
+        NRF_LOG_INFO("poll: budget exhausted, parked on saved slot %d", m_saved_slot);
+        return;
+    }
+    m_advance_budget--;
     uint8_t next = next_enabled_slot(m_cursor);
     if (next != m_cursor) {
         m_cursor = next;
