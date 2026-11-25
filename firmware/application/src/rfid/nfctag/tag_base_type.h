@@ -93,6 +93,8 @@ typedef enum {
     // DESFire series            1300
 
     // ST25TA series             2000
+    // ST25TB / SRIx (NFC-B) emulation (vendored from SecLabz/ChameleonUnleashed, GPL-3.0)
+    TAG_TYPE_ST25TB512_AT = 2000,
 
     // HF14A-4 series            3000
     TAG_TYPE_HF14A_4 = 3000,

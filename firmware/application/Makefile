@@ -35,6 +35,13 @@ SRC_FILES += \
   $(PROJ_DIR)/rfid/nfctag/hf/nfc_mf1.c \
   $(PROJ_DIR)/rfid/nfctag/hf/nfc_mf0_ntag.c \
   $(PROJ_DIR)/rfid/nfctag/hf/nfc_seos.c \
+  $(PROJ_DIR)/rfid/nfctag/hf/nfc_st25tb.c \
+  $(PROJ_DIR)/rfid/nfctag/hf/nfc_st25tb_radio.c \
+  $(PROJ_DIR)/rfid/st25tb/model.c \
+  $(PROJ_DIR)/rfid/st25tb/receiver.c \
+  $(PROJ_DIR)/rfid/iso15693/frame.c \
+  $(PROJ_DIR)/rfid/reader/rf_workspace.c \
+  $(PROJ_DIR)/utils/rf_timeslot.c \
   $(PROJ_DIR)/rfid/nfctag/lf/lf_tag_em.c \
   $(PROJ_DIR)/rfid/nfctag/lf/utils/fskdemod.c \
   $(PROJ_DIR)/rfid/nfctag/lf/utils/circular_buffer.c \
@@ -192,6 +199,10 @@ INC_FOLDERS += \
   ${PROJ_DIR}/bsp/ \
   ${PROJ_DIR}/utils/ \
   ${PROJ_DIR}/rfid/ \
+  ${PROJ_DIR}/rfid/reader/ \
+  ${PROJ_DIR}/rfid/reader/hf/ \
+  ${PROJ_DIR}/rfid/st25tb/ \
+  ${PROJ_DIR}/rfid/iso15693/ \
   ${PROJ_DIR}/rfid/crypto/ \
   ${PROJ_DIR}/rfid/nfctag/ \
   ${PROJ_DIR}/rfid/nfctag/hf \
