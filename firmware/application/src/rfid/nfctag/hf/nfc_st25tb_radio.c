@@ -565,6 +565,10 @@ static void stb_window(void) {
     NRF_NFCT->EVENTS_READY = 0;
     NRF_NFCT->EVENTS_FIELDDETECTED = 0;
     NRF_NFCT->EVENTS_FIELDLOST = 0;
+    // Disable the HW auto-collision so the NFCT does NOT auto-answer a Type-A REQA while it is in
+    // SENSE for FIELDPRESENT (otherwise a reader latches a phantom ISO14443-3A tag instead of our
+    // Type-B response). We only use SENSE->ACTIVATE to read the field, never to be a Type-A tag.
+    NRF_NFCT->AUTOCOLRESCONFIG |= NFCT_AUTOCOLRESCONFIG_MODE_Msk;
     NRF_NFCT->TASKS_SENSE = 1;
     NRF_NFCT->TASKS_ACTIVATE = 1;
     uint32_t start = DWT->CYCCNT;
@@ -671,6 +675,7 @@ static void stb_window(void) {
             __disable_irq();
             stb_transmit(reply, bytes, eof_tick + stb_t0_ticks);
             NRF_NFCT->EVENTS_READY = 0;
+            NRF_NFCT->AUTOCOLRESCONFIG |= NFCT_AUTOCOLRESCONFIG_MODE_Msk;  // no phantom Type-A on re-sense
             NRF_NFCT->TASKS_SENSE = 1;
             NRF_NFCT->TASKS_ACTIVATE = 1;
             __set_PRIMASK(irq);

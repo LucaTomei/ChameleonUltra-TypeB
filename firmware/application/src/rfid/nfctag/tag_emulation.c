@@ -434,8 +434,15 @@ void tag_emulation_sense_switch(tag_sense_type_t type, bool enable) {
         case TAG_SENSE_HF:
             if (enable && (slotConfig.slots[slot].enabled_hf) &&
                     (slotConfig.slots[slot].tag_hf != TAG_TYPE_UNDEFINED)) {
-                nfc_tag_14a_sense_switch(true);
+                if (slotConfig.slots[slot].tag_hf == TAG_TYPE_ST25TB512_AT) {
+                    nfc_tag_14a_sense_switch(false);   // ST25TB uses its own radio, not the 14A (Type-A) path
+                    nfc_st25tb_sense_switch(true);
+                } else {
+                    nfc_st25tb_sense_switch(false);
+                    nfc_tag_14a_sense_switch(true);
+                }
             } else {
+                nfc_st25tb_sense_switch(false);
                 nfc_tag_14a_sense_switch(false);
             }
             break;

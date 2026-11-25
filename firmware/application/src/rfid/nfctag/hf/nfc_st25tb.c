@@ -45,20 +45,14 @@ static void field_event(nrfx_nfct_evt_t const *event) {
 }
 
 static void watch_field(void) {
-    if (watching || !sensing) {
-        return;
-    }
-    nrf_gpio_cfg_output(HF_ANT_SEL);
-    nrf_gpio_pin_set(HF_ANT_SEL);
-    nrfx_nfct_uninit();   // release any prior owner (nfc_14a) so our init + autocolres_disable takes;
-                          // otherwise the NFCT stays in Type-A auto-collision mode (reader sees 14443-A UID 0)
-    nrfx_nfct_config_t config = {.rxtx_int_mask = 0, .cb = field_event};
-    if (nrfx_nfct_init(&config) != NRFX_SUCCESS) {
-        return;
-    }
-    nrfx_nfct_autocolres_disable();
-    nrfx_nfct_enable();
-    watching = true;
+    // Intentionally does NOT put the NFCT in SENSE mode anymore. nrfx_nfct_enable() would make the
+    // NFCT auto-answer a Type-A REQA, so a generic reader (e.g. Flipper "Read NFC") latches a
+    // phantom ISO14443-3A tag (UID 0) instead of our Type-B/ST25TB response. Field detection is
+    // done by the radio layer, which drives the NFCT SENSE->ACTIVATE (ACTIVATED does not
+    // auto-answer) only to read FIELDPRESENT. Keep nfc_14a off while an ST25TB slot is active.
+    nrfx_nfct_uninit();
+    watching = false;
+    (void)field_event;   // still referenced by the (now unused) config path; keep the symbol live
 }
 #endif
 
@@ -182,10 +176,7 @@ bool nfc_st25tb_service(void) {
     if (false) {
         return field_active;
     }
-    if (!field_active && !probe_due) {
-        watch_field();
-        return false;
-    }
+    /* Always run the ST25TB radio (no NFCT-SENSE watcher → no phantom Type-A). */
     /* Leave 10 ms after every bounded RF window to drain queued USB replies.
      * Host traffic must not prevent the next listening window. */
     if (app_timer_cnt_diff_compute(app_timer_cnt_get(), last_window) < APP_TIMER_TICKS(10)) {
@@ -203,7 +194,6 @@ bool nfc_st25tb_service(void) {
     if (!sampled) {
         if (!active) {
             nfc_st25tb_radio_stop();
-            watch_field();
         }
         return active;
     }
@@ -223,7 +213,6 @@ bool nfc_st25tb_service(void) {
         TAG_FIELD_LED_OFF();
         sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
     }
-    watch_field();
 #endif
     return false;
 }
