@@ -101,7 +101,13 @@ void nfc_poll_tick(uint32_t now_ms) {
     if (m_advance_budget == 0) {
         if (tag_emulation_get_slot() != m_saved_slot) tag_emulation_change_slot(m_saved_slot, true);
         m_cursor = m_saved_slot;
-        m_selected = true;   // stop cycling until the field drops or a reader selects a slot
+        // FORGET the field session (not just m_selected): parking re-armed the saved slot's own
+        // sense, which now owns field-loss detection. Leaving m_field_present=true would make a
+        // later nfc_poll_on_field(true) a no-op (present==m_field_present → early return), so the
+        // next field would be ignored and polling would never restart. Clearing it lets a fresh
+        // field event start a new cycle cleanly.
+        m_field_present = false;
+        m_selected = false;
         m_last_switch = now_ms;
         NRF_LOG_INFO("poll: budget exhausted, parked on saved slot %d", m_saved_slot);
         return;
