@@ -1196,15 +1196,23 @@ int main(void) {
 
         // LED feedback:
         //  - under an external reader field (emulation), show the ACTIVE SLOT on the LEDs so
-        //    field-triggered polling is visible (slot%8). This must win over the USB idle
-        //    breathing, which otherwise overrides it while on USB.
+        //    field-triggered polling is visible (slot%8). Refresh ONLY when the slot changes:
+        //    calling the LED routines every loop iteration steals time from the NFCT emulation
+        //    and makes the reader "lose the tag". One refresh per change matches what the
+        //    FIELD_DETECTED handler already does — no emulation jitter.
         //  - otherwise, the usual USB-status blink (only when the field generator is off).
+        static uint8_t s_lit_slot = 0xFF;
         if (!m_battery_status_display_active) {
             if (g_is_tag_emulating) {
-                set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
-                light_up_by_slot();
-            } else if (!m_is_field_on) {
-                blink_usb_led_status();
+                uint8_t cur = tag_emulation_get_slot();
+                if (cur != s_lit_slot) {
+                    set_slot_light_color(get_color_by_slot(cur));
+                    light_up_by_slot();
+                    s_lit_slot = cur;
+                }
+            } else {
+                s_lit_slot = 0xFF;                 // field gone: re-light on the next field
+                if (!m_is_field_on) blink_usb_led_status();
             }
         }
 
