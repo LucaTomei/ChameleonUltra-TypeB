@@ -1047,9 +1047,16 @@ static data_frame_tx_t *cmd_processor_pac_scan(uint16_t cmd, uint16_t status, ui
     return data_frame_make(cmd, STATUS_LF_TAG_OK, sizeof(card_id), card_id);
 }
 
-// PCF7930/7931: capture raw LF edge intervals and return them for host-side demod.
-// Optional request params (big-endian): [0..1] timeout_ms, [2..3] max intervals.
-#define PCF7931_RAW_LEN 4000
+// PCF7930/7931: capture the raw LF envelope (SAADC) and return it for host-side demod.
+// Il SAADC campiona l'inviluppo a ~125 ksps (1 campione per ciclo portante, 8 µs) con
+// settle antenna di 2 ms: molto meglio della cattura a fronti del comparatore per la
+// modulazione debole del PCF. Un blocco PCF (128 bit) dura ~50 ms → servono molti campioni.
+// Param opzionali (big-endian): [0..1] timeout_ms, [2..3] max campioni.
+// Frame TX max = 4096 byte. Un blocco PCF (128 bit × 64·T0 = ~65 ms) a 125 ksps sarebbe
+// ~8192 campioni: non entra. Si decima (1 su 4) così 4096 campioni coprono ~131 ms ≈ 2
+// blocchi, mantenendo ~8 campioni per simbolo 32·T0 per la demod a soglia sul host.
+#define PCF7931_RAW_LEN 4096
+#define PCF7931_RAW_DECIM 4
 #define PCF7931_RAW_TIMEOUT_MS 2000
 static data_frame_tx_t *cmd_processor_pcf7931_raw_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint32_t timeout_ms = PCF7931_RAW_TIMEOUT_MS;
@@ -1068,7 +1075,7 @@ static data_frame_tx_t *cmd_processor_pcf7931_raw_scan(uint16_t cmd, uint16_t st
         return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
     }
     size_t outlen = 0;
-    if (!pcf7931_read_raw(outdata, maxlen, timeout_ms, &outlen)) {
+    if (!raw_read_to_buffer_decim(outdata, maxlen, timeout_ms, &outlen, PCF7931_RAW_DECIM) || outlen == 0) {
         free(outdata);
         return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
     }
@@ -1094,9 +1101,10 @@ static data_frame_tx_t *cmd_processor_pcf7931_write(uint16_t cmd, uint16_t statu
 }
 
 // T5577/T55x7 default-read: the tag streams its 32-bit blocks while powered. Capture
-// the raw LF edge intervals (same generic 125 kHz edge capture as PCF7931) and let the
-// host Manchester-demodulate them. Optional params (BE): [0..1] timeout_ms, [2..3] max.
-#define T55XX_RAW_LEN 2500
+// the raw LF envelope (SAADC, come PCF7931) e lascia la demodulazione Manchester al host.
+// Param opzionali (BE): [0..1] timeout_ms, [2..3] max campioni.
+#define T55XX_RAW_LEN 4096
+#define T55XX_RAW_DECIM 2
 #define T55XX_RAW_TIMEOUT_MS 1500
 static data_frame_tx_t *cmd_processor_t55xx_raw_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint32_t timeout_ms = T55XX_RAW_TIMEOUT_MS;
@@ -1115,7 +1123,45 @@ static data_frame_tx_t *cmd_processor_t55xx_raw_scan(uint16_t cmd, uint16_t stat
         return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
     }
     size_t outlen = 0;
-    if (!pcf7931_read_raw(outdata, maxlen, timeout_ms, &outlen)) {   // generic edge capture
+    if (!raw_read_to_buffer_decim(outdata, maxlen, timeout_ms, &outlen, T55XX_RAW_DECIM) || outlen == 0) {   // SAADC envelope
+        free(outdata);
+        return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
+    }
+    data_frame_tx_t *frame = data_frame_make(cmd, STATUS_LF_TAG_OK, outlen, outdata);
+    free(outdata);
+    if (frame == NULL) {
+        return data_frame_make(cmd, STATUS_CREATE_RESPONSE_ERR, 0, NULL);
+    }
+    return frame;
+}
+
+// LF generico: cattura l'inviluppo SAADC e lo restituisce per la demod host (Indala, AWID,
+// Paradox, FDX-B, ecc.). Param opzionali (big-endian): [0..1] timeout_ms, [2..3] max
+// campioni (cap 4096 = frame TX max), [4] decimazione (1 = piena frequenza ~125 ksps).
+#define LF_RAW_SCAN_LEN 4096
+#define LF_RAW_SCAN_TIMEOUT_MS 1000
+static data_frame_tx_t *cmd_processor_lf_raw_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t timeout_ms = LF_RAW_SCAN_TIMEOUT_MS;
+    uint16_t maxlen = LF_RAW_SCAN_LEN;
+    uint8_t decim = 1;
+    if (length >= 2) {
+        timeout_ms = ((uint32_t)data[0] << 8) | data[1];
+    }
+    if (length >= 4) {
+        uint16_t m = ((uint16_t)data[2] << 8) | data[3];
+        if (m > 0 && m <= LF_RAW_SCAN_LEN) {
+            maxlen = m;
+        }
+    }
+    if (length >= 5 && data[4] > 0) {
+        decim = data[4];
+    }
+    uint8_t *outdata = malloc(maxlen);
+    if (outdata == NULL) {
+        return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
+    }
+    size_t outlen = 0;
+    if (!raw_read_to_buffer_decim(outdata, maxlen, timeout_ms, &outlen, decim) || outlen == 0) {
         free(outdata);
         return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
     }
@@ -2334,6 +2380,17 @@ static data_frame_tx_t *cmd_processor_em4x05_scan(uint16_t cmd, uint16_t status,
     payload.uid_hi    = U32HTONL(tag.uid_hi);
     payload.is_em4x69 = tag.is_em4x69 ? 1 : 0;
     return data_frame_make(cmd, STATUS_LF_TAG_OK, sizeof(payload), (uint8_t *)&payload);
+}
+
+// EM4x05/EM4x69: prova una password (login). Payload = 4 byte password (big-endian).
+// Ritorna LF_TAG_OK se il chip ACKa (password corretta), LF_TAG_NO_FOUND altrimenti.
+static data_frame_tx_t *cmd_processor_em4x05_login(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 4) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t pwd = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+    bool ok = em4x05_try_password(pwd, 1000);
+    return data_frame_make(cmd, ok ? STATUS_LF_TAG_OK : STATUS_LF_TAG_NO_FOUND, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_lf_sniff(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -4216,6 +4273,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_PCF7931_RAW_SCAN,             before_reader_run,           cmd_processor_pcf7931_raw_scan,              NULL                   },
     {    DATA_CMD_PCF7931_WRITE,                before_reader_run,           cmd_processor_pcf7931_write,                 NULL                   },
     {    DATA_CMD_T55XX_RAW_SCAN,               before_reader_run,           cmd_processor_t55xx_raw_scan,                NULL                   },
+    {    DATA_CMD_LF_RAW_SCAN,                  before_reader_run,           cmd_processor_lf_raw_scan,                   NULL                   },
     {    DATA_CMD_IDTECK_WRITE_TO_T55XX,        before_reader_run,           cmd_processor_idteck_write_to_t55xx,         NULL                   },
     {    DATA_CMD_LF_T55XX_WRITE,               before_reader_run,           cmd_processor_lf_t55xx_write,                NULL                   },
     {    DATA_CMD_ADC_GENERIC_READ,             before_reader_run,           cmd_processor_generic_read,                  NULL                   },
@@ -4229,6 +4287,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_IOPROX_DECODE_RAW,            NULL,                        cmd_processor_ioprox_decode_raw,             NULL                   },
     {    DATA_CMD_IOPROX_COMPOSE_ID,            NULL,                        cmd_processor_ioprox_compose_id,             NULL                   },
     {    DATA_CMD_EM4X05_SCAN,                  before_reader_run,           cmd_processor_em4x05_scan,                   NULL                   },
+    {    DATA_CMD_EM4X05_LOGIN,                 before_reader_run,           cmd_processor_em4x05_login,                  NULL                   },
     {    DATA_CMD_LF_SNIFF,                     before_reader_run,           cmd_processor_lf_sniff,                      NULL                   },
     {    DATA_CMD_HF14A_SNIFF,                  NULL,                        cmd_processor_hf14a_sniff,                   NULL                   },
     {    DATA_CMD_HF14A_AUTH_TRACE,             before_hf_reader_run,        cmd_processor_hf14a_auth_trace,              after_hf_reader_run    },

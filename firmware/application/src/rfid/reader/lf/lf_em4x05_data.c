@@ -344,3 +344,20 @@ uint8_t scan_em4x05(em4x05_data_t *out) {
     }
     return found ? STATUS_LF_TAG_OK : STATUS_LF_TAG_NO_FOUND;
 }
+
+// Prova una password EM4x05/EM4x69: alimenta il campo, legge il config (per sincronizzare
+// e verificare che un tag sia presente), poi tenta il login. `em4x05_login` ritorna vero
+// solo se il chip risponde con l'ACK → password corretta. Usato per attacco a dizionario.
+bool em4x05_try_password(uint32_t password, uint32_t timeout_ms) {
+    uint32_t block_timeout = timeout_ms / 2;
+    if (block_timeout < 100) block_timeout = 100;
+    start_lf_125khz_radio();
+    bsp_delay_ms(5);
+    uint32_t cfg = 0;
+    bool ok = false;
+    if (em4x05_read_block(EM4X05_BLOCK_CONFIG, &cfg, block_timeout) && cfg != 0 && cfg != 0xFFFFFFFF) {
+        ok = em4x05_login(password, block_timeout);
+    }
+    stop_lf_125khz_radio();
+    return ok;
+}
