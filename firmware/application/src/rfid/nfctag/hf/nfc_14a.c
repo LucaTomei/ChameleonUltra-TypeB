@@ -536,6 +536,7 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                     if (cl_finished) {
                         // NRF_LOG_INFO("[MFEMUL_SELECT] m_tag_state_14a = MFEMUL_WORK");
                         m_tag_state_14a = NFC_TAG_STATE_14A_ACTIVE;
+                        nfc_poll_notify_selected();   // reader locked onto this slot → stop cycling
                         if (!m_sniff_passive) {
                             nfc_tag_14a_tx_bytes(auto_coll_res->sak, 1, true);
                         }

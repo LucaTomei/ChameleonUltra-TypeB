@@ -1194,9 +1194,18 @@ int main(void) {
         }
 #endif
 
-        // Led blink at usb status (only if field generator is off)
-        if (!m_is_field_on && !m_battery_status_display_active) {
-            blink_usb_led_status();
+        // LED feedback:
+        //  - under an external reader field (emulation), show the ACTIVE SLOT on the LEDs so
+        //    field-triggered polling is visible (slot%8). This must win over the USB idle
+        //    breathing, which otherwise overrides it while on USB.
+        //  - otherwise, the usual USB-status blink (only when the field generator is off).
+        if (!m_battery_status_display_active) {
+            if (g_is_tag_emulating) {
+                set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
+                light_up_by_slot();
+            } else if (!m_is_field_on) {
+                blink_usb_led_status();
+            }
         }
 
         // Data pack process

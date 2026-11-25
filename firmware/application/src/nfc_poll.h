@@ -21,4 +21,9 @@ void nfc_poll_init(void);
 void nfc_poll_on_field(bool present);
 void nfc_poll_tick(uint32_t now_ms);
 
+// Chiamare quando il lettore ha SELEZIONATO la carta emulata (anticollisione completata):
+// ferma il ciclo degli slot finché il campo non sparisce, così il lettore può completare la
+// transazione sullo slot agganciato invece di vederlo cambiare sotto. No-op se polling off.
+void nfc_poll_notify_selected(void);
+
 #endif // NFC_POLL_H

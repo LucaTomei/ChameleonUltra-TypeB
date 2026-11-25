@@ -11,6 +11,7 @@ static bool     m_field_present = false;
 static uint8_t  m_saved_slot    = 0;      // slot to restore when the field leaves
 static uint8_t  m_cursor        = 0;      // slot currently shown while polling
 static uint32_t m_last_switch   = 0;      // timestamp of the last slot advance
+static bool     m_selected      = false;  // the reader selected the current slot → stop cycling
 
 // Is this slot usable for polling (HF or LF sense enabled)?
 static bool slot_usable(uint8_t slot) {
@@ -42,6 +43,7 @@ void nfc_poll_on_field(bool present) {
         m_saved_slot = tag_emulation_get_slot();
         m_cursor = m_saved_slot;
         m_last_switch = 0;   // allow the first advance immediately on the next tick
+        m_selected = false;  // new field session: cycle until the reader selects a slot
     } else {
         // Field left: restore the original slot.
         if (tag_emulation_get_slot() != m_saved_slot) {
@@ -51,8 +53,14 @@ void nfc_poll_on_field(bool present) {
     }
 }
 
+void nfc_poll_notify_selected(void) {
+    // The reader completed anticollision on the current slot: freeze here so the transaction
+    // can finish, instead of cycling the slot out from under it. Reset on field loss.
+    if (settings_get_polling_enable() && m_field_present) m_selected = true;
+}
+
 void nfc_poll_tick(uint32_t now_ms) {
-    if (!settings_get_polling_enable() || !m_field_present) return;
+    if (!settings_get_polling_enable() || !m_field_present || m_selected) return;
     uint16_t interval = settings_get_polling_interval();
     if (m_last_switch != 0 && (now_ms - m_last_switch) < interval) return;
     uint8_t next = next_enabled_slot(m_cursor);
