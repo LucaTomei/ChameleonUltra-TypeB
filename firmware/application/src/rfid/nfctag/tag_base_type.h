@@ -129,7 +129,8 @@ typedef enum {
         TAG_TYPE_MIFARE_4096, TAG_TYPE_NTAG_213, TAG_TYPE_NTAG_215,   \
         TAG_TYPE_NTAG_216, TAG_TYPE_MF0ICU1, TAG_TYPE_MF0ICU2,        \
         TAG_TYPE_MF0UL11, TAG_TYPE_MF0UL21, TAG_TYPE_NTAG_210,        \
-        TAG_TYPE_NTAG_212, TAG_TYPE_HF14A_4, TAG_TYPE_SEOS
+        TAG_TYPE_NTAG_212, TAG_TYPE_HF14A_4, TAG_TYPE_SEOS,          \
+        TAG_TYPE_ST25TB512_AT
 
 typedef struct {
     tag_specific_type_t tag_hf;

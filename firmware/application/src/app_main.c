@@ -43,6 +43,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "tag_persistence.h"
 #include "settings.h"
 #include "nfc_poll.h"       // field-triggered 16-slot polling (DA VALIDARE su device)
+#include "nfc_st25tb.h"     // ST25TB / SRIx (NFC-B) emulation service (vendored, GPL-3.0)
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "rc522.h"
@@ -1186,6 +1187,10 @@ int main(void) {
 
         // Advance field-triggered slot polling (no-op unless enabled + reader field present).
         if (m_poll_timer != NULL) nfc_poll_tick(m_poll_timer->time);
+
+        // ST25TB / SRIx (NFC-B) emulation service: no-op unless the active slot is ST25TB and
+        // we are in tag mode; otherwise it drives the field-detect + RF listening windows.
+        nfc_st25tb_service();
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
         // Field generator rainbow animation
