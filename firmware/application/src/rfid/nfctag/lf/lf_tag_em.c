@@ -6,6 +6,7 @@
 #include "fds_util.h"
 #include "nrf_gpio.h"
 #include "nrf_soc.h"
+#include "nfc_poll.h"
 #include "nrfx_lpcomp.h"
 #include "nrfx_pwm.h"
 #include "protocols/em410x.h"
@@ -44,6 +45,7 @@ static void lf_field_lost(void) {
     // Open the incident interruption, so that the next event can be in and out normally
     g_is_tag_emulating = false;  // Reset the flag in the emulation
     m_is_lf_emulating = false;
+    nfc_poll_on_field(false);    // LF field gone → let polling restore the saved slot (main loop)
     TAG_FIELD_LED_OFF()  // Make sure the indicator light of the LF field status
     // Re-arm LPCOMP so the next field appearance triggers lpcomp_event_handler.
     NRF_LPCOMP->INTENSET = LPCOMP_INTENSET_UP_Msk;
@@ -87,6 +89,11 @@ static void lpcomp_event_handler(nrf_lpcomp_event_t event) {
     g_is_tag_emulating = true;
     // turn off USB light effect when emulating cards
     g_usb_led_marquee_enable = false;
+
+    // Feed the slot-polling layer so an LF-only active slot still starts cycling on a field (the
+    // Type-A NFCT path never fires for it). Just sets flags — the slot change runs in the main
+    // loop (nfc_poll_tick), never from this ISR.
+    nfc_poll_on_field(true);
 
     // LED status update
     set_slot_light_color(RGB_BLUE);

@@ -785,4 +785,10 @@ void nfc_st25tb_radio_stop(void) {
     stb_absence_pending = false;
 }
 
+// True if our ST25TB tag actually answered a reader command in the last poll window (not just
+// "a field is present"). Used by the slot-polling layer as the ST25TB "selected" signal.
+bool nfc_st25tb_radio_responded(void) {
+    return stb_responded;
+}
+
 #endif /* PROJECT_CHAMELEON_ULTRA */

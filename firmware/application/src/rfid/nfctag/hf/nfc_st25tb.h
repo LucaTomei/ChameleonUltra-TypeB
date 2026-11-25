@@ -12,5 +12,6 @@ bool nfc_st25tb_set_image(const uint8_t image[77]);
 bool nfc_st25tb_get_image(uint8_t image[77]);
 bool nfc_st25tb_radio_poll(bool *field_present, bool active);
 void nfc_st25tb_radio_stop(void);
+bool nfc_st25tb_radio_responded(void);
 
 #endif

@@ -345,9 +345,9 @@ static void system_off_enter(void) {
             if (m_system_off_processing) rgb_marquee_sweep_fade(color, dir, 7, 50, 25);
             if (m_system_off_processing) rgb_marquee_sweep_fade(color, !dir, 7, 25, 0);
         } else if (animation_config == SettingsAnimationModeMinimal) {
-            if (m_system_off_processing) rgb_marquee_sweep_from_to(color, slot, !dir ? 7 : 0);
+            if (m_system_off_processing) rgb_marquee_sweep_from_to(color, led, !dir ? 7 : 0);   // led (wrapped), slot 8-15 would overflow led_pins[8]
         } else if (animation_config == SettingsAnimationModeSymmetric) {
-            if (m_system_off_processing) rgb_marquee_symmetric_in(color, slot);
+            if (m_system_off_processing) rgb_marquee_symmetric_in(color, led);                  // led (wrapped), not raw slot
         }
         rgb_marquee_stop();
         if (!m_system_off_processing) {
@@ -479,8 +479,9 @@ static void check_wakeup_src(void) {
      */
 
     uint8_t slot = tag_emulation_get_slot();
-    uint8_t dir = slot > 3 ? 1 : 0;
-    uint8_t color = get_color_by_slot(slot);
+    uint8_t led = slot % RGB_LIST_NUM;              // 16 slots, only RGB_LIST_NUM (8) LEDs
+    uint8_t dir = led > 3 ? 1 : 0;
+    uint8_t color = get_color_by_slot(slot);        // color uses the real slot
 
     if (m_reset_source & NRF_POWER_RESETREAS_OFF_MASK) {
         NRF_LOG_INFO("WakeUp from button");
@@ -491,11 +492,11 @@ static void check_wakeup_src(void) {
         if (animation_config == SettingsAnimationModeFull) {
             rgb_marquee_sweep_to(color, !dir, 11);
             rgb_marquee_sweep_to(color, dir, 11);
-            rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+            rgb_marquee_sweep_to(color, !dir, dir ? led : 7 - led);
         } else if (animation_config == SettingsAnimationModeMinimal) {
-            rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+            rgb_marquee_sweep_to(color, !dir, dir ? led : 7 - led);
         } else if (animation_config == SettingsAnimationModeSymmetric) {
-            rgb_marquee_symmetric_out(color, slot);
+            rgb_marquee_symmetric_out(color, led);
         } else {
             set_slot_light_color(color);
         }
@@ -528,9 +529,9 @@ static void check_wakeup_src(void) {
         uint8_t animation_config = settings_get_animation_config();
         if (animation_config == SettingsAnimationModeFull) {
             // In the case of field wake-up, only one round of RGB is swept as the power-on animation
-            rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+            rgb_marquee_sweep_to(color, !dir, dir ? led : 7 - led);
         } else if (animation_config == SettingsAnimationModeSymmetric) {
-            rgb_marquee_symmetric_out(color, slot);
+            rgb_marquee_symmetric_out(color, led);
         } else {
             set_slot_light_color(color);
         }
@@ -705,15 +706,17 @@ static void show_battery(void) {
 }
 
 static void play_power_on_animation(uint8_t slot, uint8_t dir, uint8_t color) {
+    uint8_t led = slot % RGB_LIST_NUM;              // 16 slots, only 8 LEDs: never index led_pins with a raw slot
+    dir = led > 3 ? 1 : 0;                           // direction follows the wrapped LED, not the raw slot
     uint8_t animation_config = settings_get_animation_config();
     if (animation_config == SettingsAnimationModeFull) {
         rgb_marquee_sweep_to(color, !dir, 11);
         rgb_marquee_sweep_to(color, dir, 11);
-        rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+        rgb_marquee_sweep_to(color, !dir, dir ? led : 7 - led);
     } else if (animation_config == SettingsAnimationModeMinimal) {
-        rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+        rgb_marquee_sweep_to(color, !dir, dir ? led : 7 - led);
     } else if (animation_config == SettingsAnimationModeSymmetric) {
-        rgb_marquee_symmetric_out(color, slot);
+        rgb_marquee_symmetric_out(color, led);
     }
 
     set_slot_light_color(color);

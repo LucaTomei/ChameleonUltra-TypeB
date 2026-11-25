@@ -1,5 +1,6 @@
 #include "nfc_st25tb.h"
 
+#include "nfc_poll.h"
 #include "fds_util.h"
 #include "st25tb/model.h"
 #include "tag_persistence.h"
@@ -153,14 +154,18 @@ void nfc_st25tb_sense_switch(bool enable) {
         }
         probe_due = false;
     }
-    if (!enable && was_sensing) {
+    if (enable) {
+        watch_field();
+    } else if (was_sensing) {
         st25tb_field_lost();
         field_active = false;
         g_is_tag_emulating = false;
         TAG_FIELD_LED_OFF();
-    } else {
-        watch_field();
     }
+    // !enable && !was_sensing: ST25TB was already off. Do NOT run watch_field()/nrfx_nfct_uninit()
+    // here: this path also runs when the active slot is Type-A (e.g. restoring sense state after an
+    // HF sniff), and tearing down the NFCT would leave Type-A emulation dead while its software
+    // state still says "enabled".
 #endif
 }
 
@@ -203,6 +208,11 @@ bool nfc_st25tb_service(void) {
         g_is_tag_emulating = true;
         g_usb_led_marquee_enable = false;
         TAG_FIELD_LED_ON();
+        // Feed the slot-polling layer: a reader field is on an ST25TB slot. If our tag actually
+        // answered a command this window, treat it as "selected" so polling freezes on this slot
+        // instead of cycling it out mid-transaction (ST25TB has no Type-A anticollision hook).
+        nfc_poll_on_field(true);
+        if (nfc_st25tb_radio_responded()) nfc_poll_notify_selected();
         return true;
     }
     nfc_st25tb_radio_stop();
@@ -211,6 +221,7 @@ bool nfc_st25tb_service(void) {
         st25tb_field_lost();
         g_is_tag_emulating = false;
         TAG_FIELD_LED_OFF();
+        nfc_poll_on_field(false);   // ST25TB field gone → let polling restore the saved slot
         sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
     }
 #endif
