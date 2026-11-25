@@ -32,6 +32,11 @@ static void field_event(nrfx_nfct_evt_t const *event) {
     if (event->evt_id != NRFX_NFCT_EVT_FIELD_DETECTED) {
         return;
     }
+    // Kill the NFCT immediately so it can't auto-answer a Type-A REQA (the reader would otherwise
+    // latch onto a bogus 14443-A UID 0 instead of our Type-B/ST25TB response). The radio layer
+    // takes over field handling from here.
+    NRF_NFCT->TASKS_DISABLE = 1;
+    __DSB();
     field_active = true;
     sleep_timer_stop();
     g_is_tag_emulating = true;
