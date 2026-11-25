@@ -543,6 +543,12 @@ static void tag_emulation_load_config(void) {
     // Read the card slot configuration data
     bool ret = fds_read_sync(FDS_EMULATION_CONFIG_FILE_ID, FDS_EMULATION_CONFIG_RECORD_KEY, &length, (uint8_t *)&slotConfig);
     if (ret) {
+        // Difesa: un record corrotto/legacy con active_slot >= TAG_MAX_SLOT_NUM causerebbe accessi OOB
+        // a slots[] (letti E scritti) prima di qualsiasi guardia FDS. Clampalo subito.
+        if (slotConfig.active_slot >= TAG_MAX_SLOT_NUM) {
+            NRF_LOG_WARNING("active_slot %d out of range, reset to 0", slotConfig.active_slot);
+            slotConfig.active_slot = 0;
+        }
         // After the reading is completed, we will save a BCC of the current configuration. When it is stored later, it can be used as a reference for the contrast between changes.
         calc_14a_crc_lut((uint8_t *)&slotConfig, sizeof(slotConfig), (uint8_t *)&m_slot_config_crc);
         NRF_LOG_INFO("Load tag slot config done.");

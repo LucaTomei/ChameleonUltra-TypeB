@@ -108,7 +108,19 @@ bool rf_timeslot_run(uint32_t microseconds, bool high_priority, bool extend, voi
     start = DWT->CYCCNT;
     while ((status == NRF_SUCCESS || status == NRF_ERROR_BUSY) && !closed &&
             DWT->CYCCNT - start < CLOSE_TIMEOUT_US * CPU_CYCLES_PER_US) __NOP();
-    if (!closed) NVIC_SystemReset();
+    if (!closed) {
+        // The radio session did not close in time. A hard reset recovers the session but DROPS the
+        // BLE link (disconnecting the app) — unacceptable while connected. Retry the close once more,
+        // and only hard-reset when NOT connected (no app to lose). If it is still stuck while
+        // connected, leave it: `active` stays true so later timeslot runs fail cleanly (ST25TB
+        // emulation degraded until a power cycle), but the app stays connected.
+        extern bool g_is_ble_connected;
+        status = sd_radio_session_close();
+        start = DWT->CYCCNT;
+        while ((status == NRF_SUCCESS || status == NRF_ERROR_BUSY) && !closed &&
+                DWT->CYCCNT - start < CLOSE_TIMEOUT_US * CPU_CYCLES_PER_US) __NOP();
+        if (!closed && !g_is_ble_connected) NVIC_SystemReset();
+    }
     last_run_cycles = DWT->CYCCNT - run_started;
     if (ran) last_grant_wait_cycles = grant_start - request_started;
     else if (requested) last_grant_wait_cycles = wait_ended - request_started;

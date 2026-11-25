@@ -80,11 +80,17 @@ int nfc_st25tb_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer) 
 
 int nfc_st25tb_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
     unsigned rec = st25tb_record_size_for(type);
-    unsigned img = st25tb_image_size_for(type);
-    if (!is_st25tb_type(type) || buffer->length < rec || !st25tb_save(buffer->buffer)) {
+    if (!is_st25tb_type(type) || buffer->length < rec) {
         return 0;
     }
-    memset(buffer->buffer + img, 0, rec - img);
+    // Azzera TUTTO il record prima del save: st25tb_save scrive st25tb_image_size() byte del modello
+    // CARICATO; se quella dimensione e' minore di quella attesa dal tipo (es. 512 caricata in uno
+    // slot st25tb04k), i byte in coda resterebbero garbage del buffer HF condiviso e finirebbero in
+    // flash. Azzerando prima, la coda non scritta resta 0.
+    memset(buffer->buffer, 0, rec);
+    if (!st25tb_save(buffer->buffer)) {
+        return 0;
+    }
     return rec;
 }
 
@@ -93,10 +99,16 @@ bool nfc_st25tb_data_factory(uint8_t slot, tag_specific_type_t type) {
         return false;
     }
     static uint8_t image[ST25TB_RECORD_SIZE_4K];      // static, not stack: 528 B would risk a stack overflow
-    memset(image, 0, sizeof(image));
+    // Carta ST25TB VERGINE: blocchi dati, OTP, contatori e blocco di sistema/lock tutti a 1 (0xFF)
+    // → completamente SCRIVIBILE, come una carta reale nuova. Con tutto a 0 si emulava una carta
+    // completamente BLOCCATA (lock attivo-basso, contatori esauriti, OTP gia' programmata) che
+    // rifiutava silenziosamente ogni scrittura.
+    memset(image, 0xff, sizeof(image));
     image[5] = (type == TAG_TYPE_ST25TB04K) ? 0x1f : 0x33;   // product code in the UID
     image[6] = 0x02;
     image[7] = 0xd0;
+    unsigned img = st25tb_image_size_for(type);
+    image[img - 1] = 0;                                      // chip_id (id anticollisione), derivato a runtime
     fds_slot_record_map_t map;
     get_fds_map_by_slot_sense_type_for_dump(slot, TAG_SENSE_HF, &map);
     return fds_write_sync(map.id, map.key, st25tb_record_size_for(type), image);
