@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 /* ST25TB / SRI model, 512-bit (16 blocks) and 4K (128 blocks).
- * RF writes affect RAM only. Counter and lock behavior follows the 512-bit part; on 4K the high
- * data blocks are served read-only (full write/lock semantics of a 4K are not modelled, which is
- * enough to clone & present the card to a reader). */
+ * RF writes affect RAM only (not persisted to flash). All data blocks are writable so a reader that
+ * updates a block sees its new value on read-back, like the real card; the low blocks keep the
+ * 512-bit lock/OTP + count-down-counter semantics, while a 4K's high blocks (16..127) are plain
+ * writable EEPROM (the 4K's own per-block lock bits are not modelled — a fidelity limit, not a read
+ * or clone problem). The inventory Chip_ID (image tail byte) is the anticollision slot id, not the
+ * card type: a reader derives 512 vs 4K from the UID product code (image[5]), so Chip_ID 0 is fine. */
 #include "model.h"
 #include "iso15693/frame.h"
 #include <string.h>
