@@ -17,6 +17,11 @@
 #include "nrf_gpio.h"
 #include <string.h>
 
+/* ST25TB emulation RF uses the Ultra's RC522/HF antenna (HF_SPI_*, HF_ANT_SEL). The Lite has no
+ * such hardware, so the whole radio is Ultra-only. nfc_st25tb.c only calls these functions inside
+ * its own PROJECT_CHAMELEON_ULTRA guards, so on Lite this translation unit is simply empty. */
+#if defined(PROJECT_CHAMELEON_ULTRA)
+
 /* --- Adaptation shims for this fork (SecLabz exposes advertising_pause / usb_hfclk_active;
  * we don't). First version: do NOT pause BLE advertising (the SoftDevice radio timeslot already
  * negotiates coexistence); run short fixed timeslot windows. If RF timing later needs longer
@@ -769,3 +774,5 @@ void nfc_st25tb_radio_stop(void) {
     stb_field_known = false;
     stb_absence_pending = false;
 }
+
+#endif /* PROJECT_CHAMELEON_ULTRA */
