@@ -121,6 +121,7 @@ static tag_base_handler_map_t tag_base_map[] = {
     {TAG_SENSE_HF, TAG_TYPE_HF14A_4,     nfc_tag_14a_4_data_loadcb,    nfc_tag_14a_4_data_savecb,    nfc_tag_14a_4_data_factory,    &m_tag_data_hf},
     {TAG_SENSE_HF, TAG_TYPE_SEOS,        nfc_tag_seos_data_loadcb,     nfc_tag_seos_data_savecb,     nfc_tag_seos_data_factory,     &m_tag_data_hf},
     {TAG_SENSE_HF, TAG_TYPE_ST25TB512_AT, nfc_st25tb_data_loadcb,      nfc_st25tb_data_savecb,       nfc_st25tb_data_factory,       &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_ST25TB04K,    nfc_st25tb_data_loadcb,      nfc_st25tb_data_savecb,       nfc_st25tb_data_factory,       &m_tag_data_hf},
 };
 
 static void tag_emulation_load_config(void);
@@ -400,7 +401,7 @@ static void tag_emulation_sense_switch_all(bool enable) {
     uint8_t slot = tag_emulation_get_slot();
     // NRF_LOG_INFO("Slot %d tag type hf %d, lf %d", slot, slotConfig.slots[slot].tag_hf, slotConfig.slots[slot].tag_lf);
     if (enable && (slotConfig.slots[slot].enabled_hf) && (slotConfig.slots[slot].tag_hf != TAG_TYPE_UNDEFINED)) {
-        if (slotConfig.slots[slot].tag_hf == TAG_TYPE_ST25TB512_AT) {
+        if (IS_ST25TB_TYPE(slotConfig.slots[slot].tag_hf)) {
             // ST25TB (NFC-B): its own radio (NFCT only for field-detect). Keep the 14A path off.
             nfc_tag_14a_sense_switch(false);
             nfc_st25tb_sense_switch(true);
@@ -434,7 +435,7 @@ void tag_emulation_sense_switch(tag_sense_type_t type, bool enable) {
         case TAG_SENSE_HF:
             if (enable && (slotConfig.slots[slot].enabled_hf) &&
                     (slotConfig.slots[slot].tag_hf != TAG_TYPE_UNDEFINED)) {
-                if (slotConfig.slots[slot].tag_hf == TAG_TYPE_ST25TB512_AT) {
+                if (IS_ST25TB_TYPE(slotConfig.slots[slot].tag_hf)) {
                     nfc_tag_14a_sense_switch(false);   // ST25TB uses its own radio, not the 14A (Type-A) path
                     nfc_st25tb_sense_switch(true);
                 } else {

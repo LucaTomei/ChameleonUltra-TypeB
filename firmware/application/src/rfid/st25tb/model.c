@@ -1,44 +1,62 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* ST25TB512-AT model.
- * RF writes affect RAM only. Counter and lock behavior follows ST25TB512-AT. */
+/* ST25TB / SRI model, 512-bit (16 blocks) and 4K (128 blocks).
+ * RF writes affect RAM only. Counter and lock behavior follows the 512-bit part; on 4K the high
+ * data blocks are served read-only (full write/lock semantics of a 4K are not modelled, which is
+ * enough to clone & present the card to a reader). */
 #include "model.h"
 #include "iso15693/frame.h"
 #include <string.h>
 
 typedef enum { READY, INVENTORY, SELECTED, DESELECTED, DEACTIVATED } state_t;
-static uint8_t image[ST25TB_IMAGE_SIZE];
+static uint8_t image[ST25TB_IMAGE_MAX];
+static unsigned num_blocks;      /* 16 (512-bit) or 128 (4K) */
+static unsigned img_size;        /* 77 or 525 */
 static state_t state;
-static uint16_t active_locks;
+static uint32_t active_locks;
 static bool loaded;
 
 static uint32_t read32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
+/* Offset of the system block: right after the N data blocks. Chip_ID follows the system block. */
+static unsigned sys_off(void) { return 8u + num_blocks * 4u; }
+static unsigned chip_off(void) { return sys_off() + 4u; }
+
 bool st25tb_loaded(void) { return loaded; }
+unsigned st25tb_image_size(void) { return loaded ? img_size : 0u; }
 void st25tb_unload(void) { loaded = false; state = READY; }
 void st25tb_field_lost(void) { state = READY; }
-bool st25tb_save(uint8_t data[ST25TB_IMAGE_SIZE]) {
+
+bool st25tb_save(uint8_t *data) {
     if (!loaded) return false;
-    memcpy(data, image, sizeof(image));
+    memcpy(data, image, img_size);
     return true;
 }
-bool st25tb_load(const uint8_t data[ST25TB_IMAGE_SIZE]) {
-    /* Accept any ST25TB / SRI 512-bit (16-block) chip: the UID always starts (wire order,
-     * bytes 7..6) with D0 02 (ST25 family + STMicroelectronics IC manufacturer). The product
-     * code (data[5], e.g. 0x33 for ST25TB512-AT/SRI512) is reported back from image[76] during
-     * anticollision, so the generic 16-block read/write model serves every 512-bit variant.
-     * 4K (128-block) chips don't fit this 16-block image and are rejected by the caller. */
-    if (!data || data[7] != 0xd0 || data[6] != 0x02)
-        return false;
-    memcpy(image, data, sizeof(image));
+
+bool st25tb_load(const uint8_t *data, unsigned image_bytes) {
+    /* Accept any ST25TB / SRI chip: the UID always ends (wire order, bytes 7..6) with D0 02 (ST25
+     * family + STMicroelectronics IC manufacturer). The block count comes from the image size:
+     * 77 bytes = 512-bit (16 blocks), 525 bytes = 4K (128 blocks). The product code (data[5]) is
+     * reported from the Chip_ID during anticollision; the generic N-block model serves all variants. */
+    if (!data || data[7] != 0xd0 || data[6] != 0x02) return false;
+    unsigned nb;
+    if (image_bytes == ST25TB_IMAGE_SIZE) nb = 16;
+    else if (image_bytes == ST25TB_IMAGE_SIZE_4K) nb = 128;
+    else return false;
+    num_blocks = nb;
+    img_size = image_bytes;
+    memcpy(image, data, image_bytes);
     state = READY;
-    active_locks = read32(image + 72) >> 16;
+    active_locks = read32(image + sys_off()) >> 16;
     loaded = true;
     return true;
 }
+
 static void write_block(unsigned address, const uint8_t *data) {
     uint32_t value = read32(data);
+    /* Low blocks keep the 512-bit OTP/counter semantics (write-protected unless lockable, and the
+     * 5/6 counters can only count down). On 4K the high blocks are not written (read-only clone). */
     if (address < 16 && (active_locks & (1u << address))) {
         uint8_t *block = image + 8 + 4 * address;
         if ((address != 5 && address != 6) || value < read32(block))
@@ -46,17 +64,18 @@ static void write_block(unsigned address, const uint8_t *data) {
         return;
     }
     if (address != 255) return;
-    /* Factory-reserved bits 15..8 stay unchanged; OTP and locks only clear. */
-    value = read32(image + 72) & (value | 0x0000ff00u);
-    for (unsigned b = 0; b < 4; b++) image[72 + b] = value >> (8 * b);
+    /* System block: factory-reserved bits 15..8 stay unchanged; OTP and locks only clear. */
+    value = read32(image + sys_off()) & (value | 0x0000ff00u);
+    for (unsigned b = 0; b < 4; b++) image[sys_off() + b] = value >> (8 * b);
 }
+
 unsigned st25tb_reply(const uint8_t *frame, unsigned length,
                       uint8_t reply[ST25TB_RESPONSE_MAX]) {
     /* CRC-B and ISO15693 share the same CRC parameters and wire order. */
     if (!loaded || length < 3 || length > ST25TB_REQUEST_MAX ||
             !iso15693_check_crc(frame, length)) return 0;
     unsigned n = 0, payload = length - 2;
-    uint8_t command = frame[0], chip = image[76];
+    uint8_t command = frame[0], chip = image[chip_off()];
     if (payload == 2 && command == 6) {
         if (frame[1] == 0 && (state == READY || state == INVENTORY || state == SELECTED)) {
             state = INVENTORY;
@@ -69,7 +88,7 @@ unsigned st25tb_reply(const uint8_t *frame, unsigned length,
     } else if (payload == 2 && command == 0x0e) {
         if (frame[1] == chip && (state == INVENTORY || state == SELECTED || state == DESELECTED)) {
             state = SELECTED;
-            active_locks = read32(image + 72) >> 16;
+            active_locks = read32(image + sys_off()) >> 16;
             reply[n++] = chip;
         } else if (state == SELECTED && frame[1] != chip) {
             state = DESELECTED;
@@ -80,8 +99,8 @@ unsigned st25tb_reply(const uint8_t *frame, unsigned length,
             n = 8;
         } else if (payload == 2 && command == 8) {
             unsigned address = frame[1];
-            if (address < 16 || address == 255) {
-                memcpy(reply, image + 8 + (address == 255 ? 16 : address) * 4, 4);
+            if (address < num_blocks || address == 255) {
+                memcpy(reply, image + 8 + (address == 255 ? num_blocks : address) * 4, 4);
                 n = 4;
             }
         } else if (payload == 1 && command == 0x0c) {

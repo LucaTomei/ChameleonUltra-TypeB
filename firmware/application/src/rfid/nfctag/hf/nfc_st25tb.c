@@ -12,7 +12,18 @@
 #include "syssleep.h"
 #include <string.h>
 
-#define ST25TB_RECORD_SIZE 80u
+#define ST25TB_RECORD_SIZE 80u       // 512-bit: image 77 padded to a word boundary
+#define ST25TB_RECORD_SIZE_4K 528u   // 4K: image 525 padded to a word boundary
+
+static unsigned st25tb_image_size_for(tag_specific_type_t t) {
+    return t == TAG_TYPE_ST25TB04K ? ST25TB_IMAGE_SIZE_4K : ST25TB_IMAGE_SIZE;
+}
+static unsigned st25tb_record_size_for(tag_specific_type_t t) {
+    return t == TAG_TYPE_ST25TB04K ? ST25TB_RECORD_SIZE_4K : ST25TB_RECORD_SIZE;
+}
+static bool is_st25tb_type(tag_specific_type_t t) {
+    return t == TAG_TYPE_ST25TB512_AT || t == TAG_TYPE_ST25TB04K;
+}
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 extern volatile bool g_usb_led_marquee_enable;
@@ -58,52 +69,58 @@ static void watch_field(void) {
 #endif
 
 int nfc_st25tb_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
-    if (type != TAG_TYPE_ST25TB512_AT || buffer->length < ST25TB_RECORD_SIZE || buffer->buffer[77] ||
-        buffer->buffer[78] || buffer->buffer[79] || !st25tb_load(buffer->buffer)) {
+    unsigned rec = st25tb_record_size_for(type);
+    unsigned img = st25tb_image_size_for(type);
+    if (!is_st25tb_type(type) || buffer->length < rec || !st25tb_load(buffer->buffer, img)) {
         st25tb_unload();
         return 0;
     }
-    return ST25TB_RECORD_SIZE;
+    return rec;
 }
 
 int nfc_st25tb_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
-    if (type != TAG_TYPE_ST25TB512_AT || buffer->length < ST25TB_RECORD_SIZE || !st25tb_save(buffer->buffer)) {
+    unsigned rec = st25tb_record_size_for(type);
+    unsigned img = st25tb_image_size_for(type);
+    if (!is_st25tb_type(type) || buffer->length < rec || !st25tb_save(buffer->buffer)) {
         return 0;
     }
-    memset(buffer->buffer + ST25TB_IMAGE_SIZE, 0, ST25TB_RECORD_SIZE - ST25TB_IMAGE_SIZE);
-    return ST25TB_RECORD_SIZE;
+    memset(buffer->buffer + img, 0, rec - img);
+    return rec;
 }
 
 bool nfc_st25tb_data_factory(uint8_t slot, tag_specific_type_t type) {
-    if (type != TAG_TYPE_ST25TB512_AT) {
+    if (!is_st25tb_type(type)) {
         return false;
     }
-    uint8_t image[ST25TB_RECORD_SIZE] = {0};
-    image[5] = 0x33;
+    uint8_t image[ST25TB_RECORD_SIZE_4K] = {0};       // max record; zero-filled image
+    image[5] = (type == TAG_TYPE_ST25TB04K) ? 0x1f : 0x33;   // product code in the UID
     image[6] = 0x02;
     image[7] = 0xd0;
     fds_slot_record_map_t map;
     get_fds_map_by_slot_sense_type_for_dump(slot, TAG_SENSE_HF, &map);
-    return fds_write_sync(map.id, map.key, sizeof(image), image);
+    return fds_write_sync(map.id, map.key, st25tb_record_size_for(type), image);
 }
 
-bool nfc_st25tb_set_image(const uint8_t data[ST25TB_IMAGE_SIZE]) {
+bool nfc_st25tb_set_image(const uint8_t *data, unsigned data_len) {
     uint8_t slot = tag_emulation_get_slot();
     tag_slot_specific_type_t types;
     tag_emulation_get_specific_types_by_slot(slot, &types);
-    // Accept any ST25TB/SRI 512-bit chip (UID wire bytes 7..6 = D0 02); the product code (data[5])
-    // is reported from image[76] during anticollision, so the 16-block model serves all 512 variants.
-    if (types.tag_hf != TAG_TYPE_ST25TB512_AT || !data || data[6] != 0x02 || data[7] != 0xd0) {
+    unsigned img = st25tb_image_size_for(types.tag_hf);
+    unsigned rec = st25tb_record_size_for(types.tag_hf);
+    // The active slot must be an ST25TB type and the payload length must match that type's image
+    // (77 for 512-bit, 525 for 4K). The UID must end in D0 02 (ST25 family + STMicro); the product
+    // code (data[5]) is reported from the Chip_ID at anticollision, so every variant is accepted.
+    if (!is_st25tb_type(types.tag_hf) || !data || data_len != img || data[6] != 0x02 || data[7] != 0xd0) {
         return false;
     }
 
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(types.tag_hf);
-    if (!buffer || buffer->length < ST25TB_RECORD_SIZE) {
+    if (!buffer || buffer->length < rec) {
         return false;
     }
 
-    uint8_t record[ST25TB_RECORD_SIZE] = {0};
-    memcpy(record, data, ST25TB_IMAGE_SIZE);
+    uint8_t record[ST25TB_RECORD_SIZE_4K] = {0};
+    memcpy(record, data, img);
     fds_slot_record_map_t map;
     get_fds_map_by_slot_sense_type_for_dump(slot, TAG_SENSE_HF, &map);
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -112,12 +129,12 @@ bool nfc_st25tb_set_image(const uint8_t data[ST25TB_IMAGE_SIZE]) {
     bool was_sensing = false;
 #endif
     nfc_st25tb_sense_switch(false);
-    if (!fds_write_sync(map.id, map.key, sizeof(record), record)) {
+    if (!fds_write_sync(map.id, map.key, rec, record)) {
         nfc_st25tb_sense_switch(was_sensing);
         return false;
     }
     // Reload only HF: LF may contain edits that have not been saved to flash.
-    memcpy(buffer->buffer, record, sizeof(record));
+    memcpy(buffer->buffer, record, rec);
     bool loaded = tag_emulation_load_by_buffer(types.tag_hf, true);
     if (loaded && get_device_mode() == DEVICE_MODE_TAG) {
         tag_emulation_sense_switch(TAG_SENSE_HF, true);
@@ -125,10 +142,10 @@ bool nfc_st25tb_set_image(const uint8_t data[ST25TB_IMAGE_SIZE]) {
     return loaded;
 }
 
-bool nfc_st25tb_get_image(uint8_t image[ST25TB_IMAGE_SIZE]) {
+bool nfc_st25tb_get_image(uint8_t *image) {
     tag_slot_specific_type_t types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &types);
-    return types.tag_hf == TAG_TYPE_ST25TB512_AT && st25tb_save(image);
+    return is_st25tb_type(types.tag_hf) && st25tb_save(image);
 }
 
 void nfc_st25tb_sense_switch(bool enable) {

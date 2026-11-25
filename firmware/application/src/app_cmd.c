@@ -3546,8 +3546,9 @@ static uint8_t s_hf14b_bb_out[32 + 64 + 2048];
 // Payload = the 77-byte image: UID(8) | 16 blocks x 4 (64) | system block(4) | chip_id(1).
 static data_frame_tx_t *cmd_processor_st25tb_emu_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     (void)status;
-    if (length != 77) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    bool ok = nfc_st25tb_set_image(data);
+    // 77 bytes = 512-bit image, 525 bytes = 4K image. set_image checks it matches the slot type.
+    if (length != 77 && length != 525) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    bool ok = nfc_st25tb_set_image(data, length);
     return data_frame_make(cmd, ok ? STATUS_SUCCESS : STATUS_PAR_ERR, 0, NULL);
 }
 
