@@ -79,8 +79,9 @@ void light_up_by_slot(void) {
     uint32_t *led_pins = hw_get_led_array();
     // The current lighting logic has not changed very much, so we only need to light up the specified lamp for the time being.
     uint8_t slot = tag_emulation_get_slot();
+    uint8_t led = slot % RGB_LIST_NUM;   // 16 slots, only RGB_LIST_NUM LEDs: wrap the LED index
     for (int i = 0; i < RGB_LIST_NUM; i++) {
-        if (i == slot) {
+        if (i == led) {
             nrf_gpio_pin_set(led_pins[i]);
         } else {
             nrf_gpio_pin_clear(led_pins[i]);
@@ -94,7 +95,8 @@ void light_up_by_slot(void) {
 void apply_slot_change(uint8_t slot_now, uint8_t slot_new) {
     uint8_t color_now = get_color_by_slot(slot_now);
     uint8_t color_new = get_color_by_slot(slot_new);
-    rgb_marquee_slot_switch(slot_now, color_now, slot_new, color_new);
+    // 16 slots, only RGB_LIST_NUM LEDs: wrap the LED indices (colors still use the real slot).
+    rgb_marquee_slot_switch(slot_now % RGB_LIST_NUM, color_now, slot_new % RGB_LIST_NUM, color_new);
 }
 
 /**

@@ -328,7 +328,8 @@ static void system_off_enter(void) {
         // Power off animation
         uint8_t animation_config = settings_get_animation_config();
         uint8_t slot = tag_emulation_get_slot();
-        uint8_t dir = slot > 3 ? 1 : 0;
+        uint8_t led = slot % RGB_LIST_NUM;   // 16 slots, only RGB_LIST_NUM (8) LEDs: wrap the LED index
+        uint8_t dir = led > 3 ? 1 : 0;
         uint8_t color = get_color_by_slot(slot);
         if (m_reset_source & (NRF_POWER_RESETREAS_NFC_MASK | NRF_POWER_RESETREAS_LPCOMP_MASK)) {
             if (m_reset_source & NRF_POWER_RESETREAS_NFC_MASK) {
@@ -338,7 +339,7 @@ static void system_off_enter(void) {
             }
         }
         if (animation_config == SettingsAnimationModeFull) {
-            if (m_system_off_processing) rgb_marquee_sweep_from_to(color, slot, dir ? 7 : 0);
+            if (m_system_off_processing) rgb_marquee_sweep_from_to(color, led, dir ? 7 : 0);
             if (m_system_off_processing) rgb_marquee_sweep_fade(color, dir, 7, 99, 75);
             if (m_system_off_processing) rgb_marquee_sweep_fade(color, !dir, 7, 75, 50);
             if (m_system_off_processing) rgb_marquee_sweep_fade(color, dir, 7, 50, 25);
