@@ -201,9 +201,14 @@ bool nfc_st25tb_service(void) {
         return field_active;
     }
     /* Always run the ST25TB radio (no NFCT-SENSE watcher → no phantom Type-A). */
-    /* Leave 10 ms after every bounded RF window to drain queued USB replies.
-     * Host traffic must not prevent the next listening window. */
-    if (app_timer_cnt_diff_compute(app_timer_cnt_get(), last_window) < APP_TIMER_TICKS(10)) {
+    /* Inter-window gap. While merely sensing, leave 10 ms after each window to drain queued USB
+     * replies. But DURING AN ACTIVE TRANSACTION keep the gap tiny (~2 ms): a long read (e.g. a 4K
+     * card's 128 blocks) spans several windows, and a reader (Flipper) sends its next Read_Block
+     * during the gap — a 10 ms hole makes it get no answer and give up ("don't move"). A ~2 ms gap
+     * is short enough that the reader's retry lands in the next open window, so the read is
+     * effectively continuous across windows. */
+    uint32_t gap_ticks = field_active ? APP_TIMER_TICKS(2) : APP_TIMER_TICKS(10);
+    if (app_timer_cnt_diff_compute(app_timer_cnt_get(), last_window) < gap_ticks) {
         return field_active;
     }
     bool active = field_active;

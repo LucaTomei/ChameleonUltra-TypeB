@@ -55,18 +55,24 @@ bool st25tb_load(const uint8_t *data, unsigned image_bytes) {
 
 static void write_block(unsigned address, const uint8_t *data) {
     uint32_t value = read32(data);
-    /* Low blocks keep the 512-bit OTP/counter semantics (write-protected unless lockable, and the
-     * 5/6 counters can only count down). On 4K the high blocks are not written (read-only clone). */
-    if (address < 16 && (active_locks & (1u << address))) {
-        uint8_t *block = image + 8 + 4 * address;
-        if ((address != 5 && address != 6) || value < read32(block))
-            memcpy(block, data, 4);
+    if (address == 255) {
+        /* System block: factory-reserved bits 15..8 stay unchanged; OTP and locks only clear. */
+        value = read32(image + sys_off()) & (value | 0x0000ff00u);
+        for (unsigned b = 0; b < 4; b++) image[sys_off() + b] = value >> (8 * b);
         return;
     }
-    if (address != 255) return;
-    /* System block: factory-reserved bits 15..8 stay unchanged; OTP and locks only clear. */
-    value = read32(image + sys_off()) & (value | 0x0000ff00u);
-    for (unsigned b = 0; b < 4; b++) image[sys_off() + b] = value >> (8 * b);
+    if (address >= num_blocks) return;                 /* out of range for this chip */
+    uint8_t *block = image + 8 + 4 * address;
+    /* Count-down counters (blocks 5 and 6) accept a write only if it decreases the value. */
+    if (address == 5 || address == 6) {
+        if (value < read32(block)) memcpy(block, data, 4);
+        return;
+    }
+    /* A locked low block is write-protected (ST25TB OTP/lock area). Every other data block —
+     * including all of a 4K's high blocks (16..127) — is writable, so a reader that updates a
+     * block (e.g. a counter/balance) sees its value on read-back, like the real card. */
+    if (address < 16 && (active_locks & (1u << address))) return;
+    memcpy(block, data, 4);
 }
 
 unsigned st25tb_reply(const uint8_t *frame, unsigned length,
