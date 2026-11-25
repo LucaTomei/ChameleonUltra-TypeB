@@ -12,6 +12,7 @@ static uint8_t  m_saved_slot    = 0;      // slot to restore when the field leav
 static uint8_t  m_cursor        = 0;      // slot currently shown while polling
 static uint32_t m_last_switch   = 0;      // timestamp of the last slot advance
 static bool     m_selected      = false;  // the reader selected the current slot → stop cycling
+static bool     m_restore_pending = false; // field left → restore the saved slot from the main loop
 
 // Is this slot usable for polling (HF or LF sense enabled)?
 static bool slot_usable(uint8_t slot) {
@@ -45,11 +46,11 @@ void nfc_poll_on_field(bool present) {
         m_last_switch = 0;   // allow the first advance immediately on the next tick
         m_selected = false;  // new field session: cycle until the reader selects a slot
     } else {
-        // Field left: restore the original slot.
-        if (tag_emulation_get_slot() != m_saved_slot) {
-            tag_emulation_change_slot(m_saved_slot, true);
-        }
-        NRF_LOG_INFO("poll: field gone, restored slot %d", m_saved_slot);
+        // Field left. NB: this runs in the NFCT FIELD_LOST interrupt — do NOT change slots here,
+        // because tag_emulation_change_slot() may fds_write_sync() and block waiting for FDS events
+        // that cannot run from the ISR (hang → watchdog reset). Defer the restore to the main loop.
+        m_selected = false;
+        if (tag_emulation_get_slot() != m_saved_slot) m_restore_pending = true;
     }
 }
 
@@ -60,7 +61,19 @@ void nfc_poll_notify_selected(void) {
 }
 
 void nfc_poll_tick(uint32_t now_ms) {
-    if (!settings_get_polling_enable() || !m_field_present || m_selected) return;
+    // Deferred slot restore from the FIELD_LOST ISR (safe here in the main loop; may fds_write_sync).
+    if (m_restore_pending) {
+        m_restore_pending = false;
+        if (tag_emulation_get_slot() != m_saved_slot) tag_emulation_change_slot(m_saved_slot, true);
+    }
+    if (!settings_get_polling_enable()) {
+        // Disabled: forget any field state so a later re-enable starts clean (no phantom cycling
+        // if a field had been present when it was turned off).
+        m_field_present = false;
+        m_selected = false;
+        return;
+    }
+    if (!m_field_present || m_selected) return;
     uint16_t interval = settings_get_polling_interval();
     if (m_last_switch != 0 && (now_ms - m_last_switch) < interval) return;
     uint8_t next = next_enabled_slot(m_cursor);
