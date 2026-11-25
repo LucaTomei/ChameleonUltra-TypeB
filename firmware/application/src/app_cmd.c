@@ -14,7 +14,7 @@
 #include "tag_persistence.h"
 #include "nrf_pwr_mgmt.h"
 #include "settings.h"
-#include "st25tb_emu.h"
+#include "nfc_st25tb.h"   // ST25TB emulation (vendored, GPL-3.0) — replaces the old st25tb_emu stub
 #include "delayed_reset.h"
 #include "netdata.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -3485,15 +3485,13 @@ static uint8_t s_hf14b_bb_samples[2048];
 static uint8_t s_hf14b_bb_out[32 + 64 + 2048];
 // SPERIMENTALE: carica un dump ST25TB nell'emulatore NFC-B.
 // payload: uid(8) | nblocks(1) | system(4) | blocks(nblocks*4)
+// Load a real ST25TB512-AT image into the ACTIVE slot (which must already be TAG_TYPE_ST25TB512_AT).
+// Payload = the 77-byte image: UID(8) | 16 blocks x 4 (64) | system block(4) | chip_id(1).
 static data_frame_tx_t *cmd_processor_st25tb_emu_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     (void)status;
-    if (length < 13) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    uint8_t nblocks = data[8];
-    if (nblocks > ST25TB_EMU_MAX_BLOCKS) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    uint16_t need = 8 + 1 + ST25TB_EMU_BLOCK_SIZE + (uint16_t)nblocks * ST25TB_EMU_BLOCK_SIZE;
-    if (length < need) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    st25tb_emu_load(&data[0], &data[9], &data[13], nblocks);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    if (length != 77) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    bool ok = nfc_st25tb_set_image(data);
+    return data_frame_make(cmd, ok ? STATUS_SUCCESS : STATUS_PAR_ERR, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_hf14b_bitbang(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {

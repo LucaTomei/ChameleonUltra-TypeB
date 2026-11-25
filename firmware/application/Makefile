@@ -11,7 +11,6 @@ SRC_FILES += \
   $(PROJ_DIR)/app_main.c \
   $(PROJ_DIR)/app_cmd.c \
   $(PROJ_DIR)/nfc_poll.c \
-  $(PROJ_DIR)/st25tb_emu.c \
   $(PROJ_DIR)/ble_main.c \
   $(PROJ_DIR)/rfid_main.c \
   $(PROJ_DIR)/settings.c \
