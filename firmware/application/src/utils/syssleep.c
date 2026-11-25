@@ -13,6 +13,7 @@ static volatile bool m_system_off_enter = false;
 extern bool g_is_ble_connected; //Link to log in BLE
 extern bool g_is_tag_emulating; //The status of the logo emulation card
 extern volatile bool m_is_field_on; //NFC field generator state from app_main.c
+extern volatile bool g_is_low_battery_shutdown; //low-battery forced shutdown (must still power off)
 
 
 /** @brief Equipment sleep timer event
@@ -66,6 +67,19 @@ void sleep_system_run(void (*sysOffSleep)(), void (*sysOnSleep)()) {
     // No task to process, sleep enter
     if (m_system_off_enter) {
         m_system_off_enter = false;
+        // Defense-in-depth: NEVER power off while still connected (BLE/USB), actively emulating a
+        // card, or in a reader field. Arming is already gated in sleep_timer_start(), but a timer
+        // could have been armed just before a BLE connection, or the state changed after arming —
+        // without this re-check the device would power off and disconnect from the app. Low-battery
+        // shutdown still powers off (it sets its own path).
+        if (!g_is_low_battery_shutdown &&
+            (g_is_ble_connected || g_is_tag_emulating || m_is_field_on ||
+             nrfx_power_usbstatus_get() != NRFX_POWER_USB_STATE_DISCONNECTED)) {
+            // Stay on in low-power idle. On a real disconnect a fresh sleep timer is armed, so the
+            // device still sleeps when it is genuinely idle.
+            sysOnSleep();
+            return;
+        }
         // Enter Sleep(System_OFF sleep mode) zzzzz.....
         sysOffSleep();
     } else {
