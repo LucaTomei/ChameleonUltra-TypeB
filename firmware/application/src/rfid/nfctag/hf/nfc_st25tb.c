@@ -92,7 +92,8 @@ bool nfc_st25tb_data_factory(uint8_t slot, tag_specific_type_t type) {
     if (!is_st25tb_type(type)) {
         return false;
     }
-    uint8_t image[ST25TB_RECORD_SIZE_4K] = {0};       // max record; zero-filled image
+    static uint8_t image[ST25TB_RECORD_SIZE_4K];      // static, not stack: 528 B would risk a stack overflow
+    memset(image, 0, sizeof(image));
     image[5] = (type == TAG_TYPE_ST25TB04K) ? 0x1f : 0x33;   // product code in the UID
     image[6] = 0x02;
     image[7] = 0xd0;
@@ -119,7 +120,8 @@ bool nfc_st25tb_set_image(const uint8_t *data, unsigned data_len) {
         return false;
     }
 
-    uint8_t record[ST25TB_RECORD_SIZE_4K] = {0};
+    static uint8_t record[ST25TB_RECORD_SIZE_4K];     // static, not stack: 528 B would risk a stack overflow
+    memset(record, 0, sizeof(record));
     memcpy(record, data, img);
     fds_slot_record_map_t map;
     get_fds_map_by_slot_sense_type_for_dump(slot, TAG_SENSE_HF, &map);

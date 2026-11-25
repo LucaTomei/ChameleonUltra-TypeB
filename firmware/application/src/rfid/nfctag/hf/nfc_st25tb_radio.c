@@ -63,7 +63,7 @@ enum {
     STB_FIELD_DROP_CYCLES = 2000 * STB_CPU_CYCLES_PER_US,
     STB_FIELD_PRESENT_PROBE_CYCLES = 200000 * STB_CPU_CYCLES_PER_US,
     STB_FIELD_ABSENT_PROBE_CYCLES = 15000 * STB_CPU_CYCLES_PER_US,
-    STB_ACTIVE_WINDOW_US = 2000000,
+    STB_ACTIVE_WINDOW_US = 1500000,   /* 1.5 s: under the 2 s watchdog, and a big read just spans a few windows (gap ~2ms) */
     STB_IDLE_WINDOW_US = 500000,
     STB_SERVICE_WINDOW_US = 25000,
     STB_USB_WINDOW_US = 500000,
@@ -590,9 +590,18 @@ static void stb_window(void) {
     st25tb_receiver_reset();
     stb_stream_start();
     uint32_t sample_origin = stb_bank_start[0];
+    uint32_t last_wdt = DWT->CYCCNT;
     while (radio_ok && (int32_t)(deadline - DWT->CYCCNT) > STB_WINDOW_WORK_GUARD_CYCLES) {
         if (nrf_gpio_pin_read(BUTTON_1) || nrf_gpio_pin_read(BUTTON_2)) {
             break;
+        }
+        // Feed the watchdog DURING the window. The WDT times out at 2 s (WDT_CONFIG_RELOAD_VALUE),
+        // and an active window can run that long while a reader streams a big read (a 4K card's 128
+        // blocks keep the loop busy for ~2 s) — the single feed before the window is then not enough
+        // and the device resets mid-read. Throttle to ~every 100 ms so it costs nothing.
+        if (DWT->CYCCNT - last_wdt > 100000u * STB_CPU_CYCLES_PER_US) {
+            bsp_wdt_feed();
+            last_wdt = DWT->CYCCNT;
         }
         unsigned available = stb_available(handled);
         if (!radio_ok) {
