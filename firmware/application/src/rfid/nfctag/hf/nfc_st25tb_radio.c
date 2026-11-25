@@ -34,6 +34,8 @@
 static inline bool advertising_pause(bool *resume) { *resume = false; return true; }
 static inline bool usb_hfclk_active(void) { return true; }
 
+extern volatile bool g_is_ble_connected;   /* ble_main.c: app connessa → coesistenza BLE (F1) */
+
 #define STB_BATCH 128u
 #define STB_MIN_BATCH_BYTES 32u
 #define STB_DMA_BANK_COUNT 3u
@@ -67,6 +69,7 @@ enum {
     STB_IDLE_WINDOW_US = 500000,
     STB_SERVICE_WINDOW_US = 25000,
     STB_USB_WINDOW_US = 500000,
+    STB_BLE_WINDOW_US = 400000,       /* app BLE connessa: finestra piu' corta per lasciare respiro alla connessione (vedi F1) */
     STB_TX_BYTE_BUDGET_US = 100,
     STB_TX_GUARD_US = 2500,
     STB_POWER_SETTLE_MS = 1,
@@ -774,7 +777,17 @@ bool nfc_st25tb_radio_poll(bool *field_present, bool active) {
             window_us = active ? STB_ACTIVE_WINDOW_US : STB_USB_WINDOW_US;
         }
     }
-    bool granted = ready && rf_timeslot_run(window_us, true, paused, stb_window);
+    // F1 — coesistenza BLE. Con l'app connessa, una finestra lunga a priorita' RADIO HIGH sottrae il
+    // radio agli eventi di connessione BLE per tutta la sua durata; su una lettura/emulazione che
+    // copre piu' finestre consecutive (gap ~2ms) si supera il supervision timeout e l'app si
+    // disconnette (lo scenario riportato: Flipper che legge la carta emulata mentre l'app e' connessa).
+    // Connessi: priorita' NORMAL (il SoftDevice intervalla gli eventi BLE e concede il timeslot nei
+    // varchi — al piu' una risposta ritardata di un connection interval, e il reader ritenta) +
+    // finestra piu' corta (una lettura lunga copre qualche finestra in piu' ma completa). Standalone
+    // (nessuna app): resta HIGH con finestra piena, il percorso di lettura gia' validato su device.
+    bool ble = g_is_ble_connected;
+    if (ble && window_us > STB_BLE_WINDOW_US) window_us = STB_BLE_WINDOW_US;
+    bool granted = ready && rf_timeslot_run(window_us, !ble, paused, stb_window);
     if (resume) {
         advertising_start(false);
     }
