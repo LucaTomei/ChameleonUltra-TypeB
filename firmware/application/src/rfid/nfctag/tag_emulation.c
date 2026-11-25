@@ -717,8 +717,12 @@ void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type) {
             break;  // never happen
     }
     NRF_LOG_INFO("tag type = %d", tag_type);
-    // After the update is completed, we need to notify the relevant data in the update of the memory
-    if (sense_type != TAG_SENSE_NO) {
+    // After the update is completed, reload the data INTO THE SHARED BUFFER — but only when `slot`
+    // is the active one. The HF/LF buffers are shared across slots: loading a NON-active slot's
+    // data here would clobber the active slot's working buffer, and the next slot switch would then
+    // save that clobbered buffer back onto the active slot (data contamination). A non-active slot's
+    // data is loaded when it is actually activated (tag_emulation_change_slot -> load_data).
+    if (sense_type != TAG_SENSE_NO && slot == tag_emulation_get_slot()) {
         load_data_by_tag_type(slot, tag_type);
         NRF_LOG_INFO("reload data success.");
     }

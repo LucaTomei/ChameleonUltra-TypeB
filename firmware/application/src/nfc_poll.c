@@ -40,9 +40,16 @@ void nfc_poll_on_field(bool present) {
     if (present == m_field_present) return;
     m_field_present = present;
     if (present) {
-        // Field just arrived: remember the active slot and start cycling from it.
-        m_saved_slot = tag_emulation_get_slot();
-        m_cursor = m_saved_slot;
+        // Field just arrived. Remember the active slot to restore later — but ONLY if we are not
+        // mid-restore from a just-ended session. On a field bounce (FIELD_LOST then FIELD_DETECTED
+        // before nfc_poll_tick runs the deferred restore), the current slot is a ROTATED one, not
+        // the user's original: overwriting m_saved_slot with it would lose the real slot forever.
+        // Keep the original saved slot and cancel the pending restore instead.
+        if (!m_restore_pending) {
+            m_saved_slot = tag_emulation_get_slot();
+        }
+        m_restore_pending = false;   // we're active again; the saved slot still points at the original
+        m_cursor = tag_emulation_get_slot();
         m_last_switch = 0;   // allow the first advance immediately on the next tick
         m_selected = false;  // new field session: cycle until the reader selects a slot
     } else {
