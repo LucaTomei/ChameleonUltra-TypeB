@@ -57,7 +57,7 @@ NRF_LOG_MODULE_REGISTER();
 #define MIN_CONN_INTERVAL               MSEC_TO_UNITS(15, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (15 ms) — tighter range = higher BLE throughput for bulk reads (e.g. ST25TB dumps). */
 #define MAX_CONN_INTERVAL               MSEC_TO_UNITS(30, UNIT_1_25_MS)             /**< Maximum acceptable connection interval (30 ms). */
 #define SLAVE_LATENCY                   0                                           /**< Slave latency. */
-#define CONN_SUP_TIMEOUT                MSEC_TO_UNITS(4000, UNIT_10_MS)             /**< Connection supervisory timeout (4 seconds), Supervision Timeout uses 10 ms units. */
+#define CONN_SUP_TIMEOUT                MSEC_TO_UNITS(6000, UNIT_10_MS)             /**< Connection supervisory timeout (6 s = max iOS). L'emulazione ST25TB puo' chiedere un timeslot radio fino a 2 s che blocca il servizio BLE: 6 s danno ~3x di margine così il link non cade per supervision timeout durante una transazione NFC-B. Entro i limiti iOS (<=6 s), unita' 10 ms. */
 #define FIRST_CONN_PARAMS_UPDATE_DELAY  APP_TIMER_TICKS(1000)                       /**< Time from initiating event to first sd_ble_gap_conn_param_update (1 s) so the tighter interval applies before the first bulk read. */
 #define NEXT_CONN_PARAMS_UPDATE_DELAY   APP_TIMER_TICKS(30000)                      /**< Time between each call to sd_ble_gap_conn_param_update after the first call (30 seconds). */
 #define MAX_CONN_PARAMS_UPDATE_COUNT    3                                           /**< Number of attempts before giving up the connection parameter negotiation. */
