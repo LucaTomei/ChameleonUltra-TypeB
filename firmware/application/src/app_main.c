@@ -42,6 +42,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "rgb_marquee.h"
 #include "tag_persistence.h"
 #include "settings.h"
+#include "nfc_poll.h"       // field-triggered 16-slot polling (DA VALIDARE su device)
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "rc522.h"
@@ -75,6 +76,10 @@ static void play_power_on_animation(uint8_t slot, uint8_t dir, uint8_t color);
 
 // NFC field generator state
 volatile bool m_is_field_on = false;
+
+// 1ms-resolution timer used to drive nfc_poll_tick() from the main loop (bsp autotimer:
+// its `time` field counts up in milliseconds). Obtained after slots are loaded.
+static autotimer *m_poll_timer = NULL;
 
 // cpu reset reason
 static uint32_t m_reset_source;
@@ -1161,6 +1166,11 @@ int main(void) {
     check_wakeup_src();       // Detect wake-up source and decide BLE broadcast and subsequent hibernation action according to the wake-up source
     tag_mode_enter();         // Enter card emulation mode by default
 
+    // Field-triggered slot polling: init AFTER settings + slots are loaded. No-op unless the
+    // user enabled polling (settings_get_polling_enable). DA VALIDARE su device.
+    nfc_poll_init();
+    m_poll_timer = bsp_obtain_timer(0);   // counts up in ms, feeds nfc_poll_tick()
+
     // usbd event listener
     APP_ERROR_CHECK(app_usbd_power_events_enable());
 
@@ -1173,6 +1183,9 @@ int main(void) {
         battery_status_display_process();
         // Button event process
         button_press_process();
+
+        // Advance field-triggered slot polling (no-op unless enabled + reader field present).
+        if (m_poll_timer != NULL) nfc_poll_tick(m_poll_timer->time);
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
         // Field generator rainbow animation

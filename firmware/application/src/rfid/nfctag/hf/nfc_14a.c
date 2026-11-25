@@ -16,6 +16,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "rfid_main.h"
 #include "syssleep.h"
 #include "tag_emulation.h"
+#include "nfc_poll.h"       // field-triggered 16-slot polling (DA VALIDARE su device)
 
 
 #if NFC_TAG_14A_RX_PARITY_AUTO_DEL_ENABLE
@@ -665,6 +666,7 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             TAG_FIELD_LED_ON()
 
             NRF_LOG_INFO("HF FIELD DETECTED");
+            nfc_poll_on_field(true);    // external reader field present → start slot cycling (if enabled)
 
             //Turn off the automatic anti -collision, MCU management all the interaction process, and then enable the NFC peripherals so that Io can be performed after enable
             // 20221108 Fix the different enable switching process of NRF52840 and NRF52832
@@ -696,6 +698,7 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             }
 
             NRF_LOG_INFO("HF FIELD LOST");
+            nfc_poll_on_field(false);   // field gone → restore the originally-active slot (if cycling)
             break;
         }
         case NRFX_NFCT_EVT_TX_FRAMESTART: {
