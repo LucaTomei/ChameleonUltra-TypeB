@@ -24,8 +24,12 @@ bool st25tb_save(uint8_t data[ST25TB_IMAGE_SIZE]) {
     return true;
 }
 bool st25tb_load(const uint8_t data[ST25TB_IMAGE_SIZE]) {
-    /* Product 0x33 is the 512-bit AT variant; other models need other rules. */
-    if (!data || data[7] != 0xd0 || data[6] != 0x02 || data[5] != 0x33)
+    /* Accept any ST25TB / SRI 512-bit (16-block) chip: the UID always starts (wire order,
+     * bytes 7..6) with D0 02 (ST25 family + STMicroelectronics IC manufacturer). The product
+     * code (data[5], e.g. 0x33 for ST25TB512-AT/SRI512) is reported back from image[76] during
+     * anticollision, so the generic 16-block read/write model serves every 512-bit variant.
+     * 4K (128-block) chips don't fit this 16-block image and are rejected by the caller. */
+    if (!data || data[7] != 0xd0 || data[6] != 0x02)
         return false;
     memcpy(image, data, sizeof(image));
     state = READY;

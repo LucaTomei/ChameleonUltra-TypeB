@@ -91,7 +91,9 @@ bool nfc_st25tb_set_image(const uint8_t data[ST25TB_IMAGE_SIZE]) {
     uint8_t slot = tag_emulation_get_slot();
     tag_slot_specific_type_t types;
     tag_emulation_get_specific_types_by_slot(slot, &types);
-    if (types.tag_hf != TAG_TYPE_ST25TB512_AT || !data || data[5] != 0x33 || data[6] != 0x02 || data[7] != 0xd0) {
+    // Accept any ST25TB/SRI 512-bit chip (UID wire bytes 7..6 = D0 02); the product code (data[5])
+    // is reported from image[76] during anticollision, so the 16-block model serves all 512 variants.
+    if (types.tag_hf != TAG_TYPE_ST25TB512_AT || !data || data[6] != 0x02 || data[7] != 0xd0) {
         return false;
     }
 
