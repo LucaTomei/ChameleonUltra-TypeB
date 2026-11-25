@@ -10,7 +10,7 @@
 APP_TIMER_DEF(m_app_sleep_timer);       //The timer for equipment sleep
 static volatile bool m_system_off_enter = false;
 
-extern bool g_is_ble_connected; //Link to log in BLE
+extern volatile bool g_is_ble_connected; //Link to log in BLE (definito volatile in ble_main.c, scritto da ISR BLE)
 extern bool g_is_tag_emulating; //The status of the logo emulation card
 extern volatile bool m_is_field_on; //NFC field generator state from app_main.c
 extern volatile bool g_is_low_battery_shutdown; //low-battery forced shutdown (must still power off)

@@ -80,7 +80,9 @@ int nfc_st25tb_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer) 
 
 int nfc_st25tb_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
     unsigned rec = st25tb_record_size_for(type);
-    if (!is_st25tb_type(type) || buffer->length < rec) {
+    // Guardia st25tb_loaded() anche per NON azzerare il buffer HF condiviso quando non c'e' nulla da
+    // salvare (st25tb_save fallirebbe e lascerebbe il buffer azzerato inutilmente).
+    if (!is_st25tb_type(type) || buffer->length < rec || !st25tb_loaded()) {
         return 0;
     }
     // Azzera TUTTO il record prima del save: st25tb_save scrive st25tb_image_size() byte del modello

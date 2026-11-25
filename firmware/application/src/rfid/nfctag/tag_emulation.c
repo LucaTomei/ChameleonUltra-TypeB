@@ -467,6 +467,10 @@ static void tag_emulation_migrate_slot_config_v0_to_v8(void) {
     // Populate new slotConfig struct
     slotConfig.version = TAG_SLOT_CONFIG_CURRENT_VERSION;
     slotConfig.active_slot = tmpbuf[0];
+    // Re-clampa: la migrazione riassegna active_slot dal byte0 legacy grezzo, aggirando la guardia
+    // in tag_emulation_load_config. Un record pre-v8 corrotto con byte0 >= TAG_MAX_SLOT_NUM
+    // verrebbe altrimenti persistito e causerebbe accessi OOB a slots[].
+    if (slotConfig.active_slot >= TAG_MAX_SLOT_NUM) slotConfig.active_slot = 0;
     // Il formato pre-v8 aveva 8 slot (4 byte ciascuno). Migra solo quelli; gli slot 8..15
     // (firmware 16-slot) sono poi azzerati da tag_emulation_migrate_slot_config_v8_to_v9().
     for (uint8_t i = 0; i < 8; i++) {

@@ -114,7 +114,7 @@ bool rf_timeslot_run(uint32_t microseconds, bool high_priority, bool extend, voi
         // and only hard-reset when NOT connected (no app to lose). If it is still stuck while
         // connected, leave it: `active` stays true so later timeslot runs fail cleanly (ST25TB
         // emulation degraded until a power cycle), but the app stays connected.
-        extern bool g_is_ble_connected;
+        extern volatile bool g_is_ble_connected;   // definito volatile in ble_main.c (scritto da ISR BLE)
         status = sd_radio_session_close();
         start = DWT->CYCCNT;
         while ((status == NRF_SUCCESS || status == NRF_ERROR_BUSY) && !closed &&
