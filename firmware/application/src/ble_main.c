@@ -644,9 +644,23 @@ void advertising_stop(void) {
 /// events — the documented way to run a radio timeslot alongside a BLE connection. The link stays
 /// connected the whole time. `free_radio` = true asks iOS for the max latency (30, i.e. ~930 ms of
 /// free radio at a 30 ms interval, within Apple's limits); false restores a responsive latency for
-/// normal app use. A no-op when not connected.
+/// normal app use.
+///
+/// NOT CONNECTED: ADVERTISING is the radio hog. The device advertises every APP_ADV_INTERVAL (40 ms),
+/// and each advertising event preempts the HIGH-priority ST25TB radio timeslot, so about one reader
+/// command in six lands while the radio is busy advertising and gets no answer -> the reader times
+/// out (FWT Timeout) and restarts the whole read, so a 4K never completes. (Diagnosed LIVE from the
+/// Flipper's own log: a miss every ~40 ms, exactly the advertising interval.) So while a reader is
+/// active we STOP advertising and restart it afterwards — standalone emulation then runs on an
+/// uninterrupted radio. No connection is dropped (there is none); the app just can't discover the
+/// device during the read, which is fine.
 void ble_set_rf_coexist(bool free_radio) {
     if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        if (free_radio) {
+            (void) sd_ble_gap_adv_stop(m_advertising.adv_handle);   // no 40 ms adv preemption during the read
+        } else {
+            advertising_start(false);                               // reader gone → discoverable again
+        }
         return;
     }
     ble_gap_conn_params_t p = {
