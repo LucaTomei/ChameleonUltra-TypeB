@@ -36,6 +36,23 @@ static bool probe_timer_created;
 static uint32_t last_window;
 APP_TIMER_DEF(probe_timer);
 
+// --- ST25TB emulation "hold" (BLE coexistence) ---
+// Type-B/ST25TB emulation runs on the software radio (SoftDevice timeslot), which a live BLE link
+// preempts every connection interval — truncating the long windows the bit-bang needs, so a reader
+// shows "don't move". When a reader field arrives we drop BLE ONCE (ble_pause) and then STAY in
+// standalone emulation for a hold window after the field goes away, so repeated reads work with no
+// per-read BLE reconnect dance. Advertising comes back only once the reader has been gone HOLD_MS.
+#define ST25TB_EMU_HOLD_MS 4000
+static bool emu_paused;                 // BLE dropped for the current emulation session
+static bool resume_timer_created;
+static volatile bool resume_due;        // set by the hold timer → service resumes advertising
+APP_TIMER_DEF(resume_timer);
+
+static void resume_tick(void *context) {
+    (void)context;
+    resume_due = true;
+}
+
 static void probe_tick(void *context) {
     (void)context;
     probe_due = true;
@@ -189,6 +206,11 @@ void nfc_st25tb_sense_switch(bool enable) {
             app_timer_stop(probe_timer);
         }
         probe_due = false;
+        // Leaving ST25TB sensing (e.g. slot change / mode switch) while BLE is paused for emulation:
+        // bring BLE back and cancel the hold timer, so the link doesn't stay dropped off an old slot.
+        if (resume_timer_created) app_timer_stop(resume_timer);
+        resume_due = false;
+        if (emu_paused) { ble_resume_after_st25tb_read(); emu_paused = false; }
     }
     if (enable) {
         watch_field();
@@ -209,6 +231,16 @@ bool nfc_st25tb_service(void) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
     if (!sensing || get_device_mode() != DEVICE_MODE_TAG) {
         return false;
+    }
+    // Hold window elapsed with no reader field: bring BLE back so the app can reconnect, and only now
+    // allow the device to sleep. Guarded by !field_active so a field that arrived meanwhile wins.
+    if (resume_due) {
+        resume_due = false;
+        if (emu_paused && !field_active) {
+            ble_resume_after_st25tb_read();
+            emu_paused = false;
+            sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
+        }
     }
     if (field_active) {
         /* A USB reset must not restart animation while the reader owns the field. */
@@ -244,13 +276,16 @@ bool nfc_st25tb_service(void) {
         return active;
     }
     if (present) {
-        if (!active) {
-            // A reader field just arrived (idle -> active). Free the radio for the transaction: a live
-            // BLE link (or advertising) caps the continuous timeslot to ~1 connection interval, which
-            // truncates the long windows the ST25TB bit-bang needs and makes the reader show
-            // "don't move". Dropping BLE here lets the read complete; advertising restarts on field loss.
+        if (!emu_paused) {
+            // First reader field of this emulation session: free the radio ONCE. A live BLE link (or
+            // advertising) caps the continuous timeslot to ~1 connection interval, truncating the long
+            // windows the ST25TB bit-bang needs → the reader shows "don't move". Dropping BLE lets the
+            // read complete. We STAY paused across repeated reads (no per-read reconnect); advertising
+            // comes back only after the reader has been gone for ST25TB_EMU_HOLD_MS (the hold timer).
             ble_pause_for_st25tb_read();
+            emu_paused = true;
         }
+        if (resume_timer_created) app_timer_stop(resume_timer);   // field back → cancel any pending resume
         field_active = true;
         sleep_timer_stop();
         g_is_tag_emulating = true;
@@ -270,8 +305,23 @@ bool nfc_st25tb_service(void) {
         g_is_tag_emulating = false;
         TAG_FIELD_LED_OFF();
         nfc_poll_on_field(false);   // ST25TB field gone → let polling restore the saved slot
-        ble_resume_after_st25tb_read();   // reader gone → advertise again so the app can reconnect
-        sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
+        if (emu_paused) {
+            // Stay in standalone emulation for a hold window so the NEXT read works immediately without
+            // a BLE reconnect. Do NOT arm the sleep timer yet (the resume handler arms it): the device
+            // must stay awake and emulating during the hold. Advertising resumes when the timer fires.
+            if (!resume_timer_created) {
+                resume_timer_created = app_timer_create(&resume_timer, APP_TIMER_MODE_SINGLE_SHOT, resume_tick) == NRF_SUCCESS;
+            }
+            if (resume_timer_created) {
+                app_timer_stop(resume_timer);
+                app_timer_start(resume_timer, APP_TIMER_TICKS(ST25TB_EMU_HOLD_MS), NULL);
+            } else {
+                ble_resume_after_st25tb_read(); emu_paused = false;   // fallback: no timer → resume now
+                sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
+            }
+        } else {
+            sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
+        }
     }
 #endif
     return false;
