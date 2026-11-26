@@ -632,23 +632,30 @@ void advertising_stop(void) {
     sd_ble_gap_adv_stop(m_advertising.adv_handle);
 }
 
-/// Free the radio for an ST25TB reader transaction: drop the active BLE link AND stop advertising.
-/// A live connection (and, to a lesser degree, advertising) caps the continuous radio timeslot to
-/// about one connection interval, because the SoftDevice preempts the timeslot for each BLE event.
-/// That truncates the long uninterrupted windows the ST25TB bit-bang needs to answer a reader, so the
-/// reader (Flipper) shows "don't move". With BLE off, the ST25TB radio gets full-length windows and
-/// the read completes. Call ble_resume_after_st25tb_read() when the reader field goes away to bring
-/// advertising back so the app can reconnect.
-void ble_pause_for_st25tb_read(void) {
-    if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
-        (void) sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+/// Free the radio for ST25TB emulation WITHOUT dropping the BLE link.
+///
+/// Why: Type-B/ST25TB emulation runs on the software radio (SoftDevice timeslot). A live BLE
+/// connection makes the SoftDevice preempt the timeslot for each connection event (every ~15-30 ms),
+/// so the long uninterrupted windows the bit-bang needs get truncated and a reader shows "don't
+/// move". Disconnecting would fix it but the user wants the link to STAY UP.
+///
+/// Instead we raise the connection's SLAVE LATENCY: the peripheral is then allowed to skip up to that
+/// many connection events, and the SoftDevice grants the Timeslot API long windows across the skipped
+/// events — the documented way to run a radio timeslot alongside a BLE connection. The link stays
+/// connected the whole time. `free_radio` = true asks iOS for the max latency (30, i.e. ~930 ms of
+/// free radio at a 30 ms interval, within Apple's limits); false restores a responsive latency for
+/// normal app use. A no-op when not connected.
+void ble_set_rf_coexist(bool free_radio) {
+    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return;
     }
-    (void) sd_ble_gap_adv_stop(m_advertising.adv_handle);
-}
-
-/// Restart advertising after an ST25TB reader transaction ended (see ble_pause_for_st25tb_read).
-void ble_resume_after_st25tb_read(void) {
-    advertising_start(false);
+    ble_gap_conn_params_t p = {
+        .min_conn_interval = MIN_CONN_INTERVAL,
+        .max_conn_interval = MAX_CONN_INTERVAL,
+        .slave_latency     = free_radio ? 30 : SLAVE_LATENCY,
+        .conn_sup_timeout  = CONN_SUP_TIMEOUT,
+    };
+    (void) sd_ble_gap_conn_param_update(m_conn_handle, &p);
 }
 
 /**@brief Function for handling Peer Manager events.
