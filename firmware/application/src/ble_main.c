@@ -102,6 +102,10 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 };
 volatile bool g_is_ble_connected = false;
 volatile bool g_is_low_battery_shutdown = false;
+// Held true while a reader is reading an emulated ST25TB slot: advertising must stay OFF for the whole
+// read (its 40 ms events preempt the software radio and break the read). This flag suppresses the
+// advertising restart, INCLUDING the SDK's auto-restart if the connection happens to drop mid-read.
+static volatile bool m_rf_hold = false;
 static ble_opt_t m_static_pin_option;
 
 // Simple function to provide an index to the next input buffer
@@ -443,6 +447,12 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             g_is_ble_connected = false;
             // call sleep_timer_start *after* unsetting g_is_ble_connected
             sleep_timer_start(SLEEP_DELAY_MS_BLE_DISCONNECTED);
+            // We disabled the SDK's auto re-advertise: re-advertise here on a NORMAL disconnect so the
+            // app can reconnect — but NOT during an ST25TB reader read (m_rf_hold), where advertising
+            // must stay off; it resumes when the read ends.
+            if (!m_rf_hold) {
+                advertising_start(false);
+            }
             break;
 
         case BLE_GAP_EVT_PHY_UPDATE_REQUEST: {
@@ -569,6 +579,10 @@ static void advertising_init(void) {
     init.config.ble_adv_fast_enabled  = true;
     init.config.ble_adv_fast_interval = APP_ADV_INTERVAL;
     init.config.ble_adv_fast_timeout  = 0;
+    // We own the restart-on-disconnect: we re-advertise ourselves in the DISCONNECTED handler, EXCEPT
+    // while an ST25TB reader read holds the radio (m_rf_hold). Otherwise the SDK would re-advertise
+    // mid-read and its 40 ms events would break the read.
+    init.config.ble_adv_on_disconnect_disabled = true;
     init.evt_handler = on_adv_evt;
 
     err_code = ble_advertising_init(&m_advertising, &init);
@@ -608,6 +622,9 @@ static void whitelist_set(pm_peer_id_list_skip_t skip) {
 /**@brief Function for starting advertising.
  */
 void advertising_start(bool erase_bonds) {
+    if (m_rf_hold) {
+        return;   // an ST25TB reader read owns the radio: stay dark until it finishes
+    }
     if (erase_bonds == true && settings_get_ble_pairing_enable_first_load()) {
         // Advertising is started by PM_EVT_PEERS_DELETE_SUCCEEDED event.
         // So we don't call `ble_advertising_start()` after `delete_bonds_all()`.
@@ -655,21 +672,28 @@ void advertising_stop(void) {
 /// uninterrupted radio. No connection is dropped (there is none); the app just can't discover the
 /// device during the read, which is fine.
 void ble_set_rf_coexist(bool free_radio) {
-    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
-        if (free_radio) {
-            (void) sd_ble_gap_adv_stop(m_advertising.adv_handle);   // no 40 ms adv preemption during the read
-        } else {
-            advertising_start(false);                               // reader gone → discoverable again
-        }
-        return;
+    m_rf_hold = free_radio;
+    // Connected: raise slave latency so the SoftDevice frees the radio for the read (keep the link —
+    // iOS caps the latency but it still helps; we do NOT disconnect). Not connected: nothing to set.
+    if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
+        ble_gap_conn_params_t p = {
+            .min_conn_interval = MIN_CONN_INTERVAL,
+            .max_conn_interval = MAX_CONN_INTERVAL,
+            .slave_latency     = free_radio ? 30 : SLAVE_LATENCY,
+            .conn_sup_timeout  = CONN_SUP_TIMEOUT,
+        };
+        (void) sd_ble_gap_conn_param_update(m_conn_handle, &p);
     }
-    ble_gap_conn_params_t p = {
-        .min_conn_interval = MIN_CONN_INTERVAL,
-        .max_conn_interval = MAX_CONN_INTERVAL,
-        .slave_latency     = free_radio ? 30 : SLAVE_LATENCY,
-        .conn_sup_timeout  = CONN_SUP_TIMEOUT,
-    };
-    (void) sd_ble_gap_conn_param_update(m_conn_handle, &p);
+    if (free_radio) {
+        // ALWAYS stop advertising for the read; m_rf_hold keeps it off even if the link drops mid-read.
+        (void) sd_ble_gap_adv_stop(m_advertising.adv_handle);
+    } else {
+        // Read over: m_rf_hold is now false, so re-advertise if we are not connected (the app can find
+        // the device again). If still connected, the link stays up and advertising isn't needed.
+        if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+            advertising_start(false);
+        }
+    }
 }
 
 /**@brief Function for handling Peer Manager events.
