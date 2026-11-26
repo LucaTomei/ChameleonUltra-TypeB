@@ -1,16 +1,31 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 /* ST25TB / SRI model, 512-bit (16 blocks) and 4K (128 blocks).
  * RF writes affect RAM only (not persisted to flash), but reproduce the real chip's write rules so a
- * reader that updates the tag sees exactly what a genuine ST25TB/SRIX would do:
- *   - blocks 0..4   : OTP area — a Write_block can only program bits 1->0, never 0->1;
- *   - blocks 5,6    : 32-bit count-down counters — a write is accepted only if it DECREASES;
- *   - blocks 7..15  : lockable via the OTP_Lock_Reg in the system block (bits b24..b31, ACTIVE LOW,
- *                     i.e. 0 = locked; b24 locks blocks 7 AND 8, b25->9, b26->10, ... b31->15) —
- *                     a locked block refuses writes;
- *   - blocks 16..127: 4K only — plain writable EEPROM (SRIX4K/ST25TB04K lock only 7..15);
- *   - block 255     : system block / OTP_Lock_Reg — its lock bits are OTP too (1->0 only).
- * The inventory Chip_ID (image tail byte) is the anticollision slot id, not the card type: a reader
- * derives 512 vs 4K from the UID product code (image[5]), so Chip_ID 0 is fine. */
+ * reader that updates the tag sees what a genuine chip would do. The two families DIFFER (datasheets
+ * ST25TB512-AT / SRI512 and ST25TB04K / SRIX4K), so the rules are per-type:
+ *
+ *   ST25TB512-AT / SRI512 (16 blocks):
+ *     - blocks 0..15 : ordinary rewritable EEPROM, each INDIVIDUALLY lockable via OTP_Lock_Reg
+ *                      (block 255) bits b16..b31, ACTIVE LOW: b(16+addr)=0 locks block `addr`
+ *                      (b16->0, b17->1, ... b31->15). NOT OTP — an unlocked block takes any value.
+ *     - blocks 5,6   : also 32-bit count-down counters (a write must DECREASE) on top of being lockable.
+ *
+ *   ST25TB04K / SRIX4K (128 blocks):
+ *     - blocks 0..4   : OTP — a Write_block can only program bits 1->0, never 0->1;
+ *     - blocks 5,6    : 32-bit count-down counters (a write must DECREASE);
+ *     - blocks 7..15  : lockable via OTP_Lock_Reg bits b24..b31, ACTIVE LOW; b24 locks blocks 7 AND 8,
+ *                       b25->9, b26->10, ... b31->15;
+ *     - blocks 16..127: plain writable EEPROM (not lockable).
+ *
+ * Common: block 255 is the system block / OTP_Lock_Reg; its lock bits are OTP (1->0 only). The real
+ * card loads NEW protections only after a valid SELECT, so the active lock mask is LATCHED at load and
+ * at each SELECT (`active_locks`), not re-read live mid-session. The inventory Chip_ID (image tail
+ * byte) is the anticollision slot id, not the card type: a reader derives 512 vs 4K from the UID
+ * product code (image[5]), so Chip_ID 0 is fine.
+ *
+ * KNOWN LIMIT (DA VALIDARE): the SRIX4K OTP auto-erase/reload mode (re-enabling 0->1 on blocks 0..4
+ * after a specific counter sequence) is NOT modelled — OTP blocks stay 1->0 only. Reproducing it
+ * wrong would be worse than leaving it out; a reader that relies on it is not supported. */
 #include "model.h"
 #include "iso15693/frame.h"
 #include <string.h>
@@ -21,6 +36,9 @@ static unsigned num_blocks;      /* 16 (512-bit) or 128 (4K) */
 static unsigned img_size;        /* 77 or 525 */
 static state_t state;
 static bool loaded;
+/* OTP_Lock_Reg (system block) latched at load and at each SELECT: the real card applies new
+ * protections only after a valid SELECT, so writes consult THIS, not the live system block. */
+static uint32_t active_locks;
 
 static uint32_t read32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
@@ -55,40 +73,52 @@ bool st25tb_load(const uint8_t *data, unsigned image_bytes) {
     img_size = image_bytes;
     memcpy(image, data, image_bytes);
     state = READY;
+    active_locks = read32(image + sys_off());          /* latch the OTP_Lock_Reg at load */
     loaded = true;
     return true;
+}
+
+/* Is `address` write-protected by the lock mask latched at the last SELECT/load? ACTIVE LOW: a 0
+ * bit means locked. The bit<->block map differs between the two families (see the header). */
+static bool block_locked(unsigned address) {
+    if (num_blocks == 16) {
+        /* 512-AT / SRI512: every block 0..15 lockable, bit b(16+addr). */
+        if (address > 15) return false;
+        return !(active_locks & (1u << (16u + address)));
+    }
+    /* 4K / SRIX4K: only blocks 7..15 lockable; b24 locks 7 AND 8, b25..b31 -> 9..15. */
+    if (address < 7 || address > 15) return false;
+    unsigned bit = (address <= 8) ? 24u : (24u + (address - 8u));
+    return !(active_locks & (1u << bit));
 }
 
 static void write_block(unsigned address, const uint8_t *data) {
     uint32_t value = read32(data);
     if (address == 255) {
-        /* System block: factory-reserved bits 15..8 stay unchanged; OTP and locks only clear. */
+        /* System block / OTP_Lock_Reg: factory-reserved bits 15..8 stay unchanged; lock bits are OTP
+         * (only clear, 1->0). The NEW protections take effect at the next SELECT (active_locks is
+         * re-latched there), like the real card — not for the writes that follow in this session. */
         value = read32(image + sys_off()) & (value | 0x0000ff00u);
         for (unsigned b = 0; b < 4; b++) image[sys_off() + b] = value >> (8 * b);
         return;
     }
     if (address >= num_blocks) return;                 /* out of range for this chip */
     uint8_t *block = image + 8 + 4 * address;
-    /* Blocks 0..4 are OTP: a normal Write_block can only program bits to 0, never back to 1 (a bit
-     * already 1 may be cleared; a 0 stays 0). The real chip rejects a 0->1 transition here. */
-    if (address <= 4) {
+    if (block_locked(address)) return;                 /* write-protected (lock latched at SELECT) */
+    /* 4K ONLY: blocks 0..4 are OTP (bits may only go 1->0). On the 512-AT the same blocks are ordinary
+     * rewritable EEPROM (handled by the plain memcpy below), so this branch is 4K-specific. */
+    if (num_blocks == 128 && address <= 4) {
         uint32_t merged = read32(block) & value;
         for (unsigned b = 0; b < 4; b++) block[b] = merged >> (8 * b);
         return;
     }
-    /* Count-down counters (blocks 5 and 6) accept a write only if it decreases the value. */
+    /* Blocks 5,6 are 32-bit count-down counters: a write is accepted only if it DECREASES. (On the
+     * 512-AT they are also lockable — already refused above if locked.) */
     if (address == 5 || address == 6) {
         if (value < read32(block)) memcpy(block, data, 4);
         return;
     }
-    /* Blocks 7..15 are lockable via the OTP_Lock_Reg in the system block (bits b24..b31, ACTIVE LOW:
-     * 0 = locked). b24 locks BOTH block 7 and 8; b25->9, b26->10, ... b31->15. A locked block refuses
-     * writes, like the real card. Blocks 16..127 (4K) are plain writable EEPROM (not lockable). */
-    if (address >= 7 && address <= 15) {
-        unsigned bit = (address <= 8) ? 24u : (24u + (address - 8u));
-        if (!(read32(image + sys_off()) & (1u << bit))) return;   /* bit 0 -> write-protected */
-    }
-    memcpy(block, data, 4);
+    memcpy(block, data, 4);                             /* unlocked EEPROM block */
 }
 
 unsigned st25tb_reply(const uint8_t *frame, unsigned length,
@@ -110,6 +140,7 @@ unsigned st25tb_reply(const uint8_t *frame, unsigned length,
     } else if (payload == 2 && command == 0x0e) {
         if (frame[1] == chip && (state == INVENTORY || state == SELECTED || state == DESELECTED)) {
             state = SELECTED;
+            active_locks = read32(image + sys_off());   /* real card loads protections at SELECT */
             reply[n++] = chip;
         } else if (state == SELECTED && frame[1] != chip) {
             state = DESELECTED;
