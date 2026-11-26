@@ -459,6 +459,13 @@ static void system_off_enter(void) {
 /**
  *@brief :Detection of wake-up source
  */
+// Diagnostica: espone la causa dell'ultimo reset (RESETREAS, letto e azzerato al boot) e il GPREGRET,
+// così l'app può distinguere un reboot per watchdog / hardfault-lockup / soft-reset(assert) / brownout.
+void app_get_reset_source(uint32_t *reason, uint32_t *gpregret) {
+    if (reason) *reason = m_reset_source;
+    if (gpregret) *gpregret = m_gpregret_val;
+}
+
 static void check_wakeup_src(void) {
     sd_power_reset_reason_get(&m_reset_source);
     sd_power_reset_reason_clr(m_reset_source);

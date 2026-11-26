@@ -106,6 +106,11 @@ volatile bool g_is_low_battery_shutdown = false;
 // read (its 40 ms events preempt the software radio and break the read). This flag suppresses the
 // advertising restart, INCLUDING the SDK's auto-restart if the connection happens to drop mid-read.
 static volatile bool m_rf_hold = false;
+// True when a slave-latency change for the RF-coexist (ST25TB read) was rejected with NRF_ERROR_BUSY
+// because a previous sd_ble_gap_conn_param_update was still in flight. We then re-issue the latency
+// the moment that update lands (BLE_GAP_EVT_CONN_PARAM_UPDATE), so the read is never left with a
+// latency-0 (window-capped) link just because the SoftDevice was momentarily busy.
+static volatile bool m_rf_latency_pending = false;
 static ble_opt_t m_static_pin_option;
 
 // Simple function to provide an index to the next input buffer
@@ -421,6 +426,29 @@ static void on_adv_evt(ble_adv_evt_t ble_adv_evt) {
     }
 }
 
+/**@brief (Re)apply the slave latency the current RF-coexist state wants.
+ *
+ * Connected: request a high latency while an ST25TB read holds the radio (m_rf_hold), else the
+ * responsive default. Not connected: nothing to do. If the SoftDevice is BUSY (a previous
+ * conn-param update still in flight) we remember it (m_rf_latency_pending) and retry from the
+ * BLE_GAP_EVT_CONN_PARAM_UPDATE handler when that update completes — using the LATEST m_rf_hold,
+ * so the final latency is correct even if the hold flipped meanwhile.
+ */
+static void rf_apply_latency(void) {
+    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        m_rf_latency_pending = false;
+        return;
+    }
+    ble_gap_conn_params_t p = {
+        .min_conn_interval = MIN_CONN_INTERVAL,
+        .max_conn_interval = MAX_CONN_INTERVAL,
+        .slave_latency     = m_rf_hold ? 30 : SLAVE_LATENCY,
+        .conn_sup_timeout  = CONN_SUP_TIMEOUT,
+    };
+    ret_code_t err_code = sd_ble_gap_conn_param_update(m_conn_handle, &p);
+    m_rf_latency_pending = (err_code == NRF_ERROR_BUSY);
+}
+
 /**@brief Function for handling BLE events.
  *
  * @param[in]   p_ble_evt   Bluetooth stack event.
@@ -452,6 +480,14 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             // must stay off; it resumes when the read ends.
             if (!m_rf_hold) {
                 advertising_start(false);
+            }
+            break;
+
+        case BLE_GAP_EVT_CONN_PARAM_UPDATE:
+            // A conn-param update just completed. If an RF-coexist latency change was deferred because
+            // the SoftDevice was BUSY, re-issue it now (idempotent; clears the pending flag on success).
+            if (m_rf_latency_pending) {
+                rf_apply_latency();
             }
             break;
 
@@ -675,15 +711,7 @@ void ble_set_rf_coexist(bool free_radio) {
     m_rf_hold = free_radio;
     // Connected: raise slave latency so the SoftDevice frees the radio for the read (keep the link —
     // iOS caps the latency but it still helps; we do NOT disconnect). Not connected: nothing to set.
-    if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
-        ble_gap_conn_params_t p = {
-            .min_conn_interval = MIN_CONN_INTERVAL,
-            .max_conn_interval = MAX_CONN_INTERVAL,
-            .slave_latency     = free_radio ? 30 : SLAVE_LATENCY,
-            .conn_sup_timeout  = CONN_SUP_TIMEOUT,
-        };
-        (void) sd_ble_gap_conn_param_update(m_conn_handle, &p);
-    }
+    rf_apply_latency();
     if (free_radio) {
         // ALWAYS stop advertising for the read; m_rf_hold keeps it off even if the link drops mid-read.
         (void) sd_ble_gap_adv_stop(m_advertising.adv_handle);
