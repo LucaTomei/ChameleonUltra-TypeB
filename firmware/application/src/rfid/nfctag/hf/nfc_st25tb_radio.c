@@ -777,25 +777,24 @@ bool nfc_st25tb_radio_poll(bool *field_present, bool active) {
             window_us = active ? STB_ACTIVE_WINDOW_US : STB_USB_WINDOW_US;
         }
     }
-    // Priorita' e lunghezza della finestra RADIO in base a SE c'e' una transazione in corso
-    // (`active` = un lettore sta leggendo la carta):
+    // Finestra RADIO: priorita' SEMPRE HIGH, lunghezza in base a SE c'e' una transazione (`active`).
     //
-    //  - IDLE (nessun campo lettore): priorita' NORMAL + finestra CORTA. Una finestra lunga a
-    //    priorita' HIGH mentre il device e' solo in ascolto AFFAMA il SoftDevice: l'advertising e
-    //    l'handshake di connessione BLE non vengono schedulati e l'app NON RIESCE A CONNETTERSI
-    //    finche' uno slot ST25TB e' lo slot attivo (a batteria: si accende, non connette, dopo il
-    //    timeout va in sleep "come se si riavviasse"). Con NORMAL + finestra corta il SoftDevice fa
-    //    advertising/connessione tra una finestra e l'altra; il campo di un lettore viene comunque
-    //    rilevato (la finestra corta legge FIELDPRESENT, passa ad `active`, il poll dopo sale).
-    //  - ATTIVO (lettore che transa): priorita' HIGH + finestra LUNGA PIENA (STB_ACTIVE_WINDOW_US),
-    //    ANCHE se l'app e' connessa. La lettura deve COMPLETARSI: accorciare la finestra quando l'app
-    //    era connessa (vecchio STB_BLE_WINDOW_US) frammentava la lettura 4K e il lettore mostrava
-    //    "don't move". Il supervision timeout BLE e' 6 s (ble_main.c) e una lettura dura ~1-2 s, quindi
-    //    il link regge; se anche cadesse, si riconnette — molto meglio di una lettura che non finisce.
+    // La priorita' deve essere HIGH anche in IDLE: a priorita' NORMAL, con l'app connessa, gli eventi
+    // di connessione BLE prelazionano le finestre idle e il lettore (Flipper) non riesce ad agganciare
+    // la carta -> "don't move". Il problema di starvation del BLE (app che non si connette a batteria
+    // con uno slot ST25TB attivo) era causato dalle finestre LUNGHE (0.5s) a priorita' HIGH, non dalla
+    // priorita' in se'. Per questo:
+    //  - IDLE (nessun campo lettore): HIGH + finestra CORTA (STB_SERVICE_WINDOW_US, 25ms). HIGH fa
+    //    girare la finestra quando serve (il lettore viene servito anche con BLE connesso), ma essendo
+    //    corta lascia varchi frequenti in cui il SoftDevice fa advertising/connessione. Basta a leggere
+    //    FIELDPRESENT e passare ad `active`; il poll dopo sale alla finestra lunga.
+    //  - ATTIVO (lettore che transa): HIGH + finestra LUNGA PIENA (STB_ACTIVE_WINDOW_US) anche con app
+    //    connessa, cosi' una lettura 4K completa non si frammenta ("don't move"). Supervision BLE 6s,
+    //    lettura ~1-2s: il link regge; se cade si riconnette.
     if (!active) {
-        window_us = STB_SERVICE_WINDOW_US;                 // idle: cedi in fretta a BLE
+        window_us = STB_SERVICE_WINDOW_US;                 // idle: finestra corta (varchi per il BLE)
     }
-    bool granted = ready && rf_timeslot_run(window_us, active, paused, stb_window);
+    bool granted = ready && rf_timeslot_run(window_us, true, paused, stb_window);
     if (resume) {
         advertising_start(false);
     }
