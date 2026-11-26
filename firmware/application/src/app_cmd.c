@@ -3552,6 +3552,17 @@ static data_frame_tx_t *cmd_processor_st25tb_emu_set(uint16_t cmd, uint16_t stat
     return data_frame_make(cmd, ok ? STATUS_SUCCESS : STATUS_PAR_ERR, 0, NULL);
 }
 
+static data_frame_tx_t *cmd_processor_st25tb_get_emu(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status; (void)length; (void)data;
+    // Diagnostics: return the exact ST25TB image the active slot is serving (UID + blocks + system +
+    // chip), so a host can decode it and verify fidelity (e.g. MyKey credit) against the real card.
+    static uint8_t image[525];   // max ST25TB image (4K); 512-bit uses 77
+    if (!nfc_st25tb_get_image(image)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    unsigned sz = nfc_st25tb_image_size();
+    if (sz != 77 && sz != 525) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    return data_frame_make(cmd, STATUS_SUCCESS, sz, image);
+}
+
 static data_frame_tx_t *cmd_processor_hf14b_bitbang(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     hf14b_bb_params_t p;
     hf14b_bb_result_t res;
@@ -4373,6 +4384,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14B_RAW_TEST,                 before_reader_run,           cmd_processor_hf14b_raw_test,                NULL                   },
     {    DATA_CMD_HF14B_BITBANG,                  before_reader_run,           cmd_processor_hf14b_bitbang,                 NULL                   },
     {    DATA_CMD_ST25TB_EMU_SET,                 NULL,                        cmd_processor_st25tb_emu_set,                NULL                   },
+    {    DATA_CMD_ST25TB_GET_EMU,                 NULL,                        cmd_processor_st25tb_get_emu,                NULL                   },
     {    DATA_CMD_HF14B_UNLOCK_SCAN,              before_reader_run,           cmd_processor_hf14b_unlock_scan,             NULL                   },
     {    DATA_CMD_HF14B_READ_BLOCKS,              before_reader_run,           cmd_processor_hf14b_read_blocks,             NULL                   },
     {    DATA_CMD_HF14B_TEAROFF,                  before_reader_run,           cmd_processor_hf14b_tearoff,                 NULL                   },

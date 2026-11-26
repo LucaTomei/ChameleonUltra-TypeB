@@ -184,6 +184,8 @@ bool nfc_st25tb_get_image(uint8_t *image) {
     return is_st25tb_type(types.tag_hf) && st25tb_save(image);
 }
 
+unsigned nfc_st25tb_image_size(void) { return st25tb_image_size(); }
+
 void nfc_st25tb_sense_switch(bool enable) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
     bool was_sensing = sensing;

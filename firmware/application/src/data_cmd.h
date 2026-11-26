@@ -106,7 +106,8 @@
 #define DATA_CMD_HF14B_VAULT_LOAD               (2061)  /* read back a stored dump blob */
 #define DATA_CMD_HF14B_VAULT_LIST               (2062)  /* bitmap of used vault indexes */
 #define DATA_CMD_HF14B_VAULT_DELETE             (2063)  /* delete a stored dump blob */
-#define DATA_CMD_ST25TB_EMU_SET                 (2064)  /* SPERIMENTALE: carica un dump ST25TB nell'emulatore NFC-B. payload: uid(8)|nblocks(1)|system(4)|blocks(nblocks*4) */
+#define DATA_CMD_ST25TB_EMU_SET                 (2064)  /* SPERIMENTALE: carica un dump ST25TB nell'emulatore NFC-B. payload: immagine 77 (512-bit) o 525 (4K) byte = uid(8)|blocchi(N*4)|system(4)|chip(1) */
+#define DATA_CMD_ST25TB_GET_EMU                 (2065)  /* diagnostica: rilegge l'immagine ST25TB emulata dallo slot attivo (77/525 byte, stesso layout di EMU_SET) */
 
 //
 // ******************************************************************
