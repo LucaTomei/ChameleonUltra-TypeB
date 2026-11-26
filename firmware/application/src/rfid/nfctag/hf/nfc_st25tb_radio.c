@@ -777,26 +777,23 @@ bool nfc_st25tb_radio_poll(bool *field_present, bool active) {
             window_us = active ? STB_ACTIVE_WINDOW_US : STB_USB_WINDOW_US;
         }
     }
-    // F1 — coesistenza BLE / avvio connessione. La priorita' e la lunghezza della finestra RADIO
-    // dipendono da SE c'e' una transazione in corso (`active` = un lettore sta leggendo la carta):
+    // Priorita' e lunghezza della finestra RADIO in base a SE c'e' una transazione in corso
+    // (`active` = un lettore sta leggendo la carta):
     //
     //  - IDLE (nessun campo lettore): priorita' NORMAL + finestra CORTA. Una finestra lunga a
     //    priorita' HIGH mentre il device e' solo in ascolto AFFAMA il SoftDevice: l'advertising e
     //    l'handshake di connessione BLE non vengono schedulati e l'app NON RIESCE A CONNETTERSI
-    //    finche' uno slot ST25TB e' lo slot attivo (scenario riportato: a batteria il device si
-    //    accende, non si connette e dopo il timeout va in sleep "come se si riavviasse"). Con NORMAL
-    //    + finestra corta il SoftDevice fa advertising/connessione tra una finestra e l'altra. Il
-    //    campo di un lettore viene comunque rilevato: la finestra corta legge FIELDPRESENT, passa ad
-    //    `active`, e il poll successivo sale alla finestra lunga.
-    //  - ATTIVO (lettore che transa): priorita' HIGH + finestra lunga, cosi' una lettura completa
-    //    (Initiate+Select+Get_UID+N blocchi) non si tronca (percorso gia' validato su device). Se
-    //    l'app e' anche connessa, si accorcia la finestra (STB_BLE_WINDOW_US) per non sforare il
-    //    supervision timeout BLE durante la transazione.
-    bool ble = g_is_ble_connected;
+    //    finche' uno slot ST25TB e' lo slot attivo (a batteria: si accende, non connette, dopo il
+    //    timeout va in sleep "come se si riavviasse"). Con NORMAL + finestra corta il SoftDevice fa
+    //    advertising/connessione tra una finestra e l'altra; il campo di un lettore viene comunque
+    //    rilevato (la finestra corta legge FIELDPRESENT, passa ad `active`, il poll dopo sale).
+    //  - ATTIVO (lettore che transa): priorita' HIGH + finestra LUNGA PIENA (STB_ACTIVE_WINDOW_US),
+    //    ANCHE se l'app e' connessa. La lettura deve COMPLETARSI: accorciare la finestra quando l'app
+    //    era connessa (vecchio STB_BLE_WINDOW_US) frammentava la lettura 4K e il lettore mostrava
+    //    "don't move". Il supervision timeout BLE e' 6 s (ble_main.c) e una lettura dura ~1-2 s, quindi
+    //    il link regge; se anche cadesse, si riconnette — molto meglio di una lettura che non finisce.
     if (!active) {
         window_us = STB_SERVICE_WINDOW_US;                 // idle: cedi in fretta a BLE
-    } else if (ble && window_us > STB_BLE_WINDOW_US) {
-        window_us = STB_BLE_WINDOW_US;                     // transazione + app connessa: finestra piu' corta
     }
     bool granted = ready && rf_timeslot_run(window_us, active, paused, stb_window);
     if (resume) {
