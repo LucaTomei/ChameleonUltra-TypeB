@@ -659,6 +659,18 @@ static void stb_window(void) {
             /* Keep the two-us start-phase margin when mapping EOF to the
              * hardware response clock. */
             uint32_t eof_tick = bank_start + n * STB_TIMER_TICKS_PER_US + STB_DMA_START_MARGIN_TICKS;
+            // Apply the command FIRST, BEFORE the transmit-timing guards. A WRITE (0x09) produces no
+            // response and must land even when the TX-setup margin is too tight to send a reply: the
+            // reader never retries a write, so skipping st25tb_reply on a tight window dropped it
+            // permanently (the intermittent "a volte scrive, a volte no"). INITIATE/SELECT/READ are
+            // idempotent, so applying before the guards is safe — if we then skip the response for
+            // timing, the reader just retries and we re-apply.
+            unsigned bytes = st25tb_reply(request, length, reply);
+            if (!bytes) {
+                continue;   // no-response command (e.g. WRITE): already applied to the emulated image
+            }
+            // Response path only: require enough time to set up and transmit the reply, and the DMA
+            // samples to be ready; otherwise skip and let the reader retry the READ in the next window.
             NRF_TIMER4->TASKS_CAPTURE[1] = 1;
             __DSB();
             if ((int32_t)(eof_tick + stb_t0_ticks - NRF_TIMER4->CC[1]) <
@@ -666,10 +678,6 @@ static void stb_window(void) {
                 continue;
             }
             if (!stb_available(handled)) {
-                continue;
-            }
-            unsigned bytes = st25tb_reply(request, length, reply);
-            if (!bytes) {
                 continue;
             }
             if ((int32_t)(deadline - DWT->CYCCNT) <

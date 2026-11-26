@@ -60,6 +60,13 @@ static data_frame_tx_t *cmd_processor_get_app_version(uint16_t cmd, uint16_t sta
 }
 
 
+extern void app_get_reset_source(uint32_t *reason, uint32_t *gpregret);
+static data_frame_tx_t *cmd_processor_get_reset_source(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t payload[2] = {0, 0};   // [0]=RESETREAS, [1]=GPREGRET (little-endian on the wire)
+    app_get_reset_source(&payload[0], &payload[1]);
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(payload), (uint8_t *)payload);
+}
+
 static data_frame_tx_t *cmd_processor_get_git_version(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     return data_frame_make(cmd, STATUS_SUCCESS, strlen(GIT_VERSION), (uint8_t *)GIT_VERSION);
 }
@@ -4195,6 +4202,7 @@ static data_frame_tx_t *cmd_processor_hf14b_vault_delete(uint16_t cmd, uint16_t 
 #endif
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
+    {    DATA_CMD_GET_RESET_SOURCE,             NULL,                        cmd_processor_get_reset_source,              NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
     {    DATA_CMD_GET_DEVICE_MODE,              NULL,                        cmd_processor_get_device_mode,               NULL                   },
     {    DATA_CMD_SET_ACTIVE_SLOT,              NULL,                        cmd_processor_set_active_slot,               NULL                   },
