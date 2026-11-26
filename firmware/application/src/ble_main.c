@@ -632,6 +632,25 @@ void advertising_stop(void) {
     sd_ble_gap_adv_stop(m_advertising.adv_handle);
 }
 
+/// Free the radio for an ST25TB reader transaction: drop the active BLE link AND stop advertising.
+/// A live connection (and, to a lesser degree, advertising) caps the continuous radio timeslot to
+/// about one connection interval, because the SoftDevice preempts the timeslot for each BLE event.
+/// That truncates the long uninterrupted windows the ST25TB bit-bang needs to answer a reader, so the
+/// reader (Flipper) shows "don't move". With BLE off, the ST25TB radio gets full-length windows and
+/// the read completes. Call ble_resume_after_st25tb_read() when the reader field goes away to bring
+/// advertising back so the app can reconnect.
+void ble_pause_for_st25tb_read(void) {
+    if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
+        (void) sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+    }
+    (void) sd_ble_gap_adv_stop(m_advertising.adv_handle);
+}
+
+/// Restart advertising after an ST25TB reader transaction ended (see ble_pause_for_st25tb_read).
+void ble_resume_after_st25tb_read(void) {
+    advertising_start(false);
+}
+
 /**@brief Function for handling Peer Manager events.
  *
  * @param[in] p_evt  Peer Manager event.

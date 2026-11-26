@@ -10,6 +10,7 @@
 #include "app_timer.h"
 
 #include "syssleep.h"
+#include "ble_main.h"
 #include <string.h>
 
 #define ST25TB_RECORD_SIZE 80u       // 512-bit: image 77 padded to a word boundary
@@ -243,6 +244,13 @@ bool nfc_st25tb_service(void) {
         return active;
     }
     if (present) {
+        if (!active) {
+            // A reader field just arrived (idle -> active). Free the radio for the transaction: a live
+            // BLE link (or advertising) caps the continuous timeslot to ~1 connection interval, which
+            // truncates the long windows the ST25TB bit-bang needs and makes the reader show
+            // "don't move". Dropping BLE here lets the read complete; advertising restarts on field loss.
+            ble_pause_for_st25tb_read();
+        }
         field_active = true;
         sleep_timer_stop();
         g_is_tag_emulating = true;
@@ -262,6 +270,7 @@ bool nfc_st25tb_service(void) {
         g_is_tag_emulating = false;
         TAG_FIELD_LED_OFF();
         nfc_poll_on_field(false);   // ST25TB field gone → let polling restore the saved slot
+        ble_resume_after_st25tb_read();   // reader gone → advertise again so the app can reconnect
         sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
     }
 #endif
