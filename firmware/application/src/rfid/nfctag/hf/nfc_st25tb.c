@@ -48,6 +48,8 @@ APP_TIMER_DEF(probe_timer);
 static bool emu_paused;                 // high RF-coexist latency is currently requested for emulation
 static bool resume_timer_created;
 static volatile bool resume_due;        // set by the hold timer → restore the responsive BLE latency
+static uint32_t active_miss_since;      // app_timer tick in cui è iniziata una serie di finestre attive
+                                        // SENZA campionamento (0 = nessuna); watchdog anti-blocco coexist
 APP_TIMER_DEF(resume_timer);
 
 static void resume_tick(void *context) {
@@ -277,9 +279,34 @@ bool nfc_st25tb_service(void) {
     if (!sampled) {
         if (!active) {
             nfc_st25tb_radio_stop();
+            active_miss_since = 0;
+            return active;
+        }
+        // ACTIVE ma nessun campionamento in questa finestra. Di norma è transitorio (timeslot
+        // momentaneamente negato dal BLE). Ma se PERSISTE — lettore andato via senza un edge di
+        // field-loss pulito, oppure guasto radio (granted/radio_ok sempre falsi) — non si raggiunge
+        // mai il ramo field-lost e advertising resterebbe soppresso e la slave latency fissa a 30
+        // finché non si cambia slot o si riavvia. Watchdog: dopo ST25TB_EMU_HOLD_MS senza alcun
+        // campione, dichiara il campo perso e ripristina SUBITO la coesistenza (niente hold window:
+        // siamo già oltre un timeout) così il link torna reattivo/scopribile da solo.
+        uint32_t now = app_timer_cnt_get();
+        if (active_miss_since == 0) {
+            active_miss_since = now;
+        } else if (app_timer_cnt_diff_compute(now, active_miss_since) >= APP_TIMER_TICKS(ST25TB_EMU_HOLD_MS)) {
+            active_miss_since = 0;
+            nfc_st25tb_radio_stop();
+            field_active = false;
+            st25tb_field_lost();
+            g_is_tag_emulating = false;
+            TAG_FIELD_LED_OFF();
+            nfc_poll_on_field(false);
+            if (emu_paused) { ble_set_rf_coexist(false); emu_paused = false; }
+            sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
+            return false;
         }
         return active;
     }
+    active_miss_since = 0;   // campionato: azzera il watchdog anti-blocco
     if (present) {
         if (!emu_paused) {
             // First reader field of this emulation session: raise the BLE slave latency ONCE so the

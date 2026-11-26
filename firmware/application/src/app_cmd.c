@@ -3548,9 +3548,10 @@ static data_frame_tx_t *cmd_processor_hf14b_raw_test(uint16_t cmd, uint16_t stat
 static uint8_t s_hf14b_bb_samples[2048];
 static uint8_t s_hf14b_bb_out[32 + 64 + 2048];
 // SPERIMENTALE: carica un dump ST25TB nell'emulatore NFC-B.
-// payload: uid(8) | nblocks(1) | system(4) | blocks(nblocks*4)
-// Load a real ST25TB512-AT image into the ACTIVE slot (which must already be TAG_TYPE_ST25TB512_AT).
-// Payload = the 77-byte image: UID(8) | 16 blocks x 4 (64) | system block(4) | chip_id(1).
+// Load a real ST25TB image into the ACTIVE slot (which must already be an ST25TB type matching the
+// size). Payload = the full image: 77 byte per il 512-bit — UID(8) | 16 blocchi x4 (64) | system(4) |
+// chip_id(1) — oppure 525 byte per il 4K — UID(8) | 128 blocchi x4 (512) | system(4) | chip_id(1).
+// set_image verifica che la dimensione corrisponda al tipo di slot.
 static data_frame_tx_t *cmd_processor_st25tb_emu_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     (void)status;
     // 77 bytes = 512-bit image, 525 bytes = 4K image. set_image checks it matches the slot type.
