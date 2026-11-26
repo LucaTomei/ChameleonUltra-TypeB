@@ -65,7 +65,10 @@ enum {
     STB_FIELD_DROP_CYCLES = 2000 * STB_CPU_CYCLES_PER_US,
     STB_FIELD_PRESENT_PROBE_CYCLES = 200000 * STB_CPU_CYCLES_PER_US,
     STB_FIELD_ABSENT_PROBE_CYCLES = 15000 * STB_CPU_CYCLES_PER_US,
-    STB_ACTIVE_WINDOW_US = 1500000,   /* 1.5 s: under the 2 s watchdog, and a big read just spans a few windows (gap ~2ms) */
+    STB_ACTIVE_WINDOW_US = 2000000,   /* 2.0 s (= timeslot max): the longest continuous window so a marginal 4K read
+                                       * (128 blocks + the reader's "don't move" retries) completes WITHIN ONE window.
+                                       * 1.5 s tipped a borderline 4K read into failure. Reset-safe: the watchdog is 8 s
+                                       * and is fed inside the window loop. */
     STB_IDLE_WINDOW_US = 500000,
     STB_SERVICE_WINDOW_US = 25000,
     STB_USB_WINDOW_US = 500000,
