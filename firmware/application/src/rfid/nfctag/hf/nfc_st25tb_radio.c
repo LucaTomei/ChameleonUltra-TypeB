@@ -777,22 +777,19 @@ bool nfc_st25tb_radio_poll(bool *field_present, bool active) {
             window_us = active ? STB_ACTIVE_WINDOW_US : STB_USB_WINDOW_US;
         }
     }
-    // Finestra RADIO: priorita' SEMPRE HIGH, lunghezza in base a SE c'e' una transazione (`active`).
-    //
-    // La priorita' deve essere HIGH anche in IDLE: a priorita' NORMAL, con l'app connessa, gli eventi
-    // di connessione BLE prelazionano le finestre idle e il lettore (Flipper) non riesce ad agganciare
-    // la carta -> "don't move". Il problema di starvation del BLE (app che non si connette a batteria
-    // con uno slot ST25TB attivo) era causato dalle finestre LUNGHE (0.5s) a priorita' HIGH, non dalla
-    // priorita' in se'. Per questo:
-    //  - IDLE (nessun campo lettore): HIGH + finestra CORTA (STB_SERVICE_WINDOW_US, 25ms). HIGH fa
-    //    girare la finestra quando serve (il lettore viene servito anche con BLE connesso), ma essendo
-    //    corta lascia varchi frequenti in cui il SoftDevice fa advertising/connessione. Basta a leggere
-    //    FIELDPRESENT e passare ad `active`; il poll dopo sale alla finestra lunga.
-    //  - ATTIVO (lettore che transa): HIGH + finestra LUNGA PIENA (STB_ACTIVE_WINDOW_US) anche con app
-    //    connessa, cosi' una lettura 4K completa non si frammenta ("don't move"). Supervision BLE 6s,
-    //    lettura ~1-2s: il link regge; se cade si riconnette.
-    if (!active) {
-        window_us = STB_SERVICE_WINDOW_US;                 // idle: finestra corta (varchi per il BLE)
+    // Finestra RADIO: priorita' SEMPRE HIGH. La lunghezza della finestra IDLE dipende da se c'e' una
+    // connessione BLE attiva:
+    //  - STANDALONE (nessun BLE connesso): finestra idle LUNGA (STB_IDLE/USB_WINDOW, 0.5s). Una
+    //    finestra corta (25ms) e' dominata dall'overhead di open/close del RC522: il lettore non
+    //    riesce ad agganciare la carta e mostra "don't move" ANCHE senza telefono. Con 0.5s il primo
+    //    contatto e' affidabile (percorso validato su device). Non c'e' BLE da affamare.
+    //  - CONNESSO: finestra idle CORTA (25ms) per lasciare varchi al link BLE finche' non arriva un
+    //    lettore; al rilevamento del campo si alza la slave latency e la finestra ATTIVA (lunga)
+    //    serve la lettura completa.
+    // ATTIVO (lettore che transa): finestra LUNGA PIENA (STB_ACTIVE_WINDOW_US) in entrambi i casi.
+    extern volatile bool g_is_ble_connected;
+    if (!active && g_is_ble_connected) {
+        window_us = STB_SERVICE_WINDOW_US;                 // idle + connesso: finestra corta (varchi per il BLE)
     }
     bool granted = ready && rf_timeslot_run(window_us, true, paused, stb_window);
     if (resume) {
