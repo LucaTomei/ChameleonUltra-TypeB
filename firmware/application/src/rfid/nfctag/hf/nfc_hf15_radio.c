@@ -49,10 +49,11 @@ enum {
     HFV_WINDOW_WORK_GUARD_CYCLES = 2000 * HFV_CPU_CYCLES_PER_US,
     /* ISO15693 t1 = 4352/fc = 320.9 us (+-2.4 us) from the rising edge ending the reader's EOF pause to
      * the start of our SOF, whose first 3 halves (56.64 us) are unmodulated: the transmitted stream starts
-     * at the first subcarrier pulse (k_sof = S S S U S), nominally 377.5 us after that edge. eof_end is
-     * stamped ~1 us early (first carrier sample) and the TX start adds ~2.5 us (start margin + capture):
-     * 374 lands the first pulse on the nominal. DA VALIDARE: tune if a reader misses us. */
-    HFV_REPLY_FIRST_PULSE_US = 374,
+     * at the first subcarrier pulse (k_sof = S S S U S), nominally 377.5 us after that edge. The first
+     * pulse goes out ~2 us after reply_at (start margin) and eof_end trails the real edge by the ADC /
+     * detection lag (~1-3 us, not measured yet): 372 aims at the nominal. DA VALIDARE with a scope or a
+     * reader's timing log, then adjust this one constant. */
+    HFV_REPLY_FIRST_PULSE_US = 372,
     HFV_RESPONSE_WAIT_TIMEOUT_CYCLES = 1000 * HFV_CPU_CYCLES_PER_US,
     HFV_FIELD_PROBE_CYCLES = 100 * HFV_CPU_CYCLES_PER_US,
     HFV_FIELD_LOSS_CYCLES = 3000 * HFV_CPU_CYCLES_PER_US,

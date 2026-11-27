@@ -72,6 +72,7 @@ typedef struct {
      * measured from it, so a DC offset of the RC522 ADC does not hide the pauses. 0 = ideal ADC. */
     int32_t  zero_i, zero_q;
     bool     sof_fresh;      /* the pending lone pause came from idle (not from a decode error) */
+    bool     new_window;     /* restarted: the next pause's time is not comparable with the last one */
 } hf15_rx_t;
 
 void hf15_rx_reset(hf15_rx_t *rx);              /* full reset (including diagnostics) */

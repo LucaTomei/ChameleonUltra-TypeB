@@ -122,6 +122,7 @@ void hf15_rx_restart(hf15_rx_t *rx) {
     rx->eof_only = keep.eof_only; rx->last_error = keep.last_error; rx->peak_level = keep.peak_level;
     rx->last_pause_us = keep.last_pause_us; rx->last_pause_len = keep.last_pause_len;
     rx->zero_i = keep.zero_i; rx->zero_q = keep.zero_q;     /* a property of the ADC, not of the window */
+    rx->new_window = true;
 }
 
 void hf15_rx_settle(hf15_rx_t *rx, uint32_t samples) { rx->settle = samples; }
@@ -171,8 +172,8 @@ static inline int32_t absdiff(int32_t a) { return a < 0 ? -a : a; }
 
 hf15_rx_event_t hf15_rx_pause(hf15_rx_t *rx, uint32_t start, uint32_t end) {
     uint32_t prev_end = rx->last_pause_us + rx->last_pause_len;
-    bool quiet = rx->pauses == 0 || (int32_t)((start - prev_end) * 256u) > RX_MARKER_QUIET_Q8 ||
-                 start < prev_end;                 /* new window: times restart from 0 */
+    bool quiet = rx->pauses == 0 || rx->new_window || (int32_t)((start - prev_end) * 256u) > RX_MARKER_QUIET_Q8;
+    rx->new_window = false;                       /* times of the previous window are not comparable */
     rx->pauses++;
     rx->last_pause_us = start;
     rx->last_pause_len = end - start;
@@ -380,10 +381,12 @@ static unsigned win(const uint8_t *s, unsigned n, unsigned ch, int32_t a_q8, int
     return e;
 }
 
-#define TD_MAX_SOF_ATTEMPTS 32u     /* SOF candidates tried per channel/scale (each one H further on) */
+#define TD_MAX_SOF_ATTEMPTS 12u     /* SOF candidates per channel/scale (one H apart): clears a ~10 H burst */
+#define TD_DEEP_BITS        16u     /* a failed candidate that decoded this many bits was a "deep" one */
+#define TD_MAX_DEEP_FAILURES 3u     /* bounds the CPU of a hopeless decode (~2x a single full pass) */
 
 static bool td_frame(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8, int32_t sof, unsigned thr,
-                     uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d);
+                     uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d, unsigned *depth);
 
 static bool td_try(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8,
                    uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d) {
@@ -412,6 +415,7 @@ static bool td_try(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8,
      * not a valid response (switch-on transient, interference) must not end the search: on any failure
      * keep scanning after it. */
     int32_t from = (int32_t)TD_NOISE_FROM * 256;
+    unsigned deep_failures = 0;
     for (unsigned attempt = 0; attempt < TD_MAX_SOF_ATTEMPTS; attempt++) {
         int32_t sof = -1;
         for (int32_t a = from; (a + 5 * h_q8) >> 8 <= (int32_t)n; a += 256) {
@@ -423,11 +427,15 @@ static bool td_try(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8,
         }
         if (sof < 0) return false;
         from = sof + h_q8;
-        if (td_frame(s, n, ch, h_q8, sof, thr, out, cap, out_len, d)) {
+        unsigned depth = 0;
+        if (td_frame(s, n, ch, h_q8, sof, thr, out, cap, out_len, d, &depth)) {
             d->noise = (uint16_t)noise;
             d->peak = (uint16_t)peak;
             return true;
         }
+        /* A candidate that decoded a lot of data before failing (bad CRC, no EOF) is expensive to retry
+         * from inside itself: a few of those mean this channel/scale is not going to decode. */
+        if (depth >= TD_DEEP_BITS && ++deep_failures >= TD_MAX_DEEP_FAILURES) return false;
     }
     return false;
 }
@@ -435,7 +443,7 @@ static bool td_try(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8,
 /* One candidate SOF at coarse position `sof`: align, check S S S U S, decode the Manchester data up to
  * the EOF and verify the CRC. */
 static bool td_frame(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8, int32_t sof, unsigned thr,
-                     uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d) {
+                     uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d, unsigned *depth) {
     int32_t best = sof, best_score = -0x7fffffff;
     for (int32_t a = sof - h_q8 / 2; a <= sof + h_q8; a += 128) {
         if (a < 256) continue;
@@ -485,6 +493,7 @@ static bool td_frame(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8, in
         if (bits >= cap * 8u) return false;
         if (w1 > w0) out[bits >> 3] |= (uint8_t)(1u << (bits & 7u));
         bits++;
+        *depth = bits;
     }
     if (!eof || (bits & 7u) || bits < 24u) return false;
     unsigned len = bits >> 3;
