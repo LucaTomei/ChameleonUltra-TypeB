@@ -3600,6 +3600,19 @@ static data_frame_tx_t *cmd_processor_hf15_emu_diag(uint16_t cmd, uint16_t statu
     return data_frame_make(cmd, STATUS_SUCCESS, (uint16_t)n, out);
 }
 
+// DEBUG bring-up: dump a slice of the emulation RX raw-ADC ring. req: u16 offset (LE). resp: u16 wr (LE,
+// current ring write index) + up to 250 raw bytes from that offset. Host reorders oldest->newest by wr.
+extern unsigned nfc_hf15_radio_capture(uint8_t *out, unsigned offset, unsigned max, unsigned *wr_out);
+static data_frame_tx_t *cmd_processor_hf15_emu_capture(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status;
+    unsigned offset = (length >= 2) ? ((unsigned)data[0] | ((unsigned)data[1] << 8)) : 0;
+    uint8_t out[2 + 250];
+    unsigned wr = 0;
+    unsigned n = nfc_hf15_radio_capture(out + 2, offset, 250, &wr);
+    out[0] = (uint8_t)(wr & 0xFF); out[1] = (uint8_t)(wr >> 8);
+    return data_frame_make(cmd, STATUS_SUCCESS, (uint16_t)(2 + n), out);
+}
+
 /*
  * NFC-V reader transceive.
  * request (BE): u8 flags (bit0 reset + field on first, bit1 keep the field on after, bit2 return raw samples),
@@ -4514,6 +4527,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF15_EMU_SET,                   NULL,                        cmd_processor_hf15_emu_set,                  NULL                   },
     {    DATA_CMD_HF15_EMU_GET,                   NULL,                        cmd_processor_hf15_emu_get,                  NULL                   },
     {    DATA_CMD_HF15_EMU_DIAG,                  NULL,                        cmd_processor_hf15_emu_diag,                 NULL                   },
+    {    DATA_CMD_HF15_EMU_CAPTURE,               NULL,                        cmd_processor_hf15_emu_capture,              NULL                   },
 #endif
 };
 data_frame_tx_t *cmd_processor_get_device_capabilities(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {

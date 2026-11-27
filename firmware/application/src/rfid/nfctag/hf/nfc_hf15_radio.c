@@ -117,6 +117,31 @@ static bool hfv_responded;
 extern bool g_is_reader_antenna_on;
 
 static hf15_rx_t hfv_rx;
+/* DEBUG bring-up: raw ADC-sample ring of the emulation RX, dumped via HF15_EMU_CAPTURE to feed the host
+ * codec test with REAL reader waveforms (the synthetic model passes but the device doesn't — tune here). */
+#define HFV_CAP_SIZE 4096u
+#define HFV_CAP_REARM 0xFFFFu
+static uint8_t hfv_cap[HFV_CAP_SIZE];
+static volatile unsigned hfv_cap_wr;
+static volatile bool hfv_cap_frozen;       /* stop writing once a real command burst landed, so the ring holds it */
+static uint16_t hfv_cap_pause_base;        /* pauses counter at the last arm, to detect a real command burst */
+/* offset==HFV_CAP_REARM: re-arm (unfreeze, reset) and return. Else: dump a raw slice at `offset`; the host
+ * reorders oldest->newest using *wr_out. Freezes after a BURST of pauses (a real reader command) lands, not on
+ * the first noise blip, so the dump holds the strong command burst (see the feed loop). */
+unsigned nfc_hf15_radio_capture(uint8_t *out, unsigned offset, unsigned max, unsigned *wr_out) {
+    if (wr_out) { *wr_out = hfv_cap_wr; }
+    if (offset == HFV_CAP_REARM) {
+        hfv_cap_pause_base = hfv_rx.pauses;
+        hfv_cap_wr = 0;
+        hfv_cap_frozen = false;
+        return 0;
+    }
+    if (offset >= HFV_CAP_SIZE) { return 0; }
+    unsigned k = HFV_CAP_SIZE - offset;
+    if (k > max) { k = max; }
+    memcpy(out, hfv_cap + offset, k);
+    return k;
+}
 static uint8_t hfv_reply[ISO15693_RESPONSE_MAX];
 static uint8_t hfv_halves[(HFV_TX_HALVES_MAX + 7) / 8];     /* bit-packed reply, filled before the timed loop */
 static uint16_t hfv_windows, hfv_replies, hfv_late;
@@ -591,9 +616,20 @@ static void hfv_window(void) {
             bytes = HFV_BATCH;
         }
         uint32_t t_us = (bank_start - sample_origin) / HFV_TIMER_TICKS_PER_US + n;
+        if (!hfv_cap_frozen) {   /* DEBUG: capture the raw ADC bytes into the ring for host-side codec tuning */
+            const uint8_t *csrc = hfv_dma_at(ready) + n;
+            unsigned w = hfv_cap_wr;
+            for (unsigned k = 0; k < bytes; k++) { hfv_cap[w] = csrc[k]; if (++w >= HFV_CAP_SIZE) { w = 0; } }
+            hfv_cap_wr = w;
+        }
         unsigned used = 0;
         uint32_t eof_end = 0;
         hf15_rx_event_t ev = hf15_rx_feed(&hfv_rx, hfv_dma_at(ready) + n, bytes, t_us, &used, &eof_end);
+        /* DEBUG: freeze the capture ring once a BURST of pauses (a real reader command, not a noise blip)
+         * has accumulated since arming, so the 4 ms ring holds the strong command waveform. */
+        if (!hfv_cap_frozen && ((uint16_t)(hfv_rx.pauses - hfv_cap_pause_base) >= 40u || ev == HF15_RX_FRAME)) {
+            hfv_cap_frozen = true;
+        }
         n += used;
         bool restart = false;
         bool replied = false;
