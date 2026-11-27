@@ -1,12 +1,22 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* ISO15693 (NFC-V) emulation RF. Hardware handling is taken VERBATIM from nfc_st25tb_radio.c (validated
- * on device for ST25TB): RC522 with the field off as an ADC receiver of the reader's carrier, SPIM3
- * streaming TestADCReg into three DMA banks, TIMER3/TIMER4 + PPI timestamping, NFCT SENSE/ACTIVATE only
- * to read FIELDPRESENT, HF_ANT_SEL GPIO load modulation, same windows / watchdog / BLE coexistence.
- * Only the protocol layer differs: the hf15 codec decodes the reader's "1 out of 4/256" pauses and the
- * reply is load-modulated at fc/32 (423.75 kHz) with ISO15693 Manchester coding (SOF/EOF per the Flipper
- * reference). ST25TB and NFC-V never run together (one HF type per slot), so they share the hardware and
- * the RF workspace exactly like ST25TB alone does. DA VALIDARE su device: RF timing constants below. */
+/* ISO15693 (NFC-V) emulation RF.
+ *
+ * RX: the reader's "1 out of 4 / 1 out of 256" PPM is recovered from the nRF52840 NFCT carrier-lock
+ * detector (FIELDPRESENT.LOCKDETECT), NOT from the RC522 ADC. The RC522 field-off ADC path never
+ * coupled the reader carrier reliably (carrier coverage ~0%); the hardware lock detector drops cleanly
+ * during each reader pause. LOCKDETECT edges are timestamped with DWT->CYCCNT (64 MHz) and decoded in
+ * software. Proven on device 2026-11-27: a real Flipper Inventory (26 01 00 + CRC) decodes with the
+ * CRC valid, falling-edge gaps landing on exact multiples of the 604.13-cycle PPM tick. Approach from
+ * SecLabz/ChameleonUltra-Tonie (same nRF52840 + RC522 board).
+ *
+ * TX: the reply is load-modulated at fc/32 (423.75 kHz) by bit-banging HF_ANT_SEL (a P1 GPIO), with the
+ * ISO15693 SOF/EOF + Manchester half-bits produced by the host-tested hf15 codec. NFCT is disabled for
+ * the duration of the reply (an active NFCT suppresses this board's GPIO load modulation), then
+ * re-sensed/activated so LOCKDETECT is live again for the next command.
+ *
+ * ST25TB and NFC-V never run together (one HF type per slot), so they share the HF antenna / RF
+ * workspace / timeslot machinery exactly like ST25TB alone does. RC522 is kept powered with its field
+ * OFF (same as the qualified ST25TB emulation) so it does not drive the antenna. */
 #include "nfc_hf15.h"
 #include "iso15693/hf15_model.h"
 #include "iso15693/hf15_codec.h"
@@ -14,9 +24,6 @@
 #include "rf_timeslot.h"
 #include "nrfx_power.h"
 #include "usb_main.h"
-#include "nrfx_ppi.h"
-#include "nrfx_timer.h"
-#include "../../reader/rf_workspace.h"
 #include "rfid_main.h"
 #include "bsp_delay.h"
 #include "bsp_wdt.h"
@@ -30,50 +37,24 @@
 static inline bool hfv_advertising_pause(bool *resume) { *resume = false; return true; }   /* as ST25TB */
 static inline bool hfv_usb_hfclk_active(void) { return true; }
 
-#define HFV_BATCH 128u
-#define HFV_MIN_BATCH_BYTES 32u
-#define HFV_DMA_BANK_COUNT 3u
-#define HFV_DMA_BANK_BYTES 8192u
-#define HFV_DMA_GUARD_BYTES 32u
-#define HFV_DMA_LAG_BYTES 16u
-#define HFV_DMA_START_MARGIN_TICKS 32u
-#define HFV_TX_SETUP_RESERVE_US 10u
-
 enum {
     HFV_CPU_CYCLES_PER_US = 64,
-    HFV_TIMER_TICKS_PER_US = 16,
-    HFV_SPI_TIMEOUT_CYCLES = 1000 * HFV_CPU_CYCLES_PER_US,
-    HFV_DMA_EVENT_TIMEOUT_CYCLES = 100 * HFV_CPU_CYCLES_PER_US,
     HFV_NFCT_READY_TIMEOUT_CYCLES = 100 * HFV_CPU_CYCLES_PER_US,
     HFV_WINDOW_CLEANUP_CYCLES = 2000 * HFV_CPU_CYCLES_PER_US,
     HFV_WINDOW_WORK_GUARD_CYCLES = 2000 * HFV_CPU_CYCLES_PER_US,
-    /* ISO15693 t1 = 4352/fc = 320.9 us (+-2.4 us) from the rising edge ending the reader's EOF pause to
-     * the start of our SOF, whose first 3 halves (56.64 us) are unmodulated: the transmitted stream starts
-     * at the first subcarrier pulse (k_sof = S S S U S), nominally 377.5 us after that edge. The first
-     * pulse goes out ~2 us after reply_at (start margin) and eof_end trails the real edge by the ADC /
-     * detection lag (~1-3 us, not measured yet): 372 aims at the nominal. DA VALIDARE with a scope or a
-     * reader's timing log, then adjust this one constant. */
-    HFV_REPLY_FIRST_PULSE_US = 372,
     HFV_RESPONSE_WAIT_TIMEOUT_CYCLES = 1000 * HFV_CPU_CYCLES_PER_US,
-    HFV_FIELD_PROBE_CYCLES = 100 * HFV_CPU_CYCLES_PER_US,
     HFV_FIELD_LOSS_CYCLES = 3000 * HFV_CPU_CYCLES_PER_US,
-    HFV_FIELD_DROP_CYCLES = 2000 * HFV_CPU_CYCLES_PER_US,
-    HFV_FIELD_PRESENT_PROBE_CYCLES = 200000 * HFV_CPU_CYCLES_PER_US,
-    HFV_FIELD_ABSENT_PROBE_CYCLES = 15000 * HFV_CPU_CYCLES_PER_US,
     HFV_ACTIVE_WINDOW_US = 2000000,
     HFV_IDLE_WINDOW_US = 500000,
     HFV_SERVICE_WINDOW_US = 25000,
     HFV_USB_WINDOW_US = 500000,
-    HFV_TX_GUARD_US = 2500,
-    HFV_HALF_BIT_US_CEIL = 19,          /* 18.879 us rounded up, for the transmit-time budget */
-    HFV_RX_SETTLE_SAMPLES = 32,         /* skip the ADC recovery after our own load modulation */
     HFV_POWER_SETTLE_MS = 1,
     HFV_RESET_SETTLE_US = 500,
     HFV_RESET_SETTLE_MS = 10,
-    HFV_RECEIVE_SETTLE_US = 100,
 };
 
-/* RC522 field-off ADC reception + GPIO modulation: identical to the qualified ST25TB settings. */
+/* RC522 held with the field off (identical to the qualified ST25TB settings), only so it does not drive
+ * the HF antenna while NFCT senses the field and HF_ANT_SEL does the load modulation. */
 enum {
     RC522_SPI_ADDRESS_MASK = 0x7e,
     RC522_SPI_READ = 0x80,
@@ -91,7 +72,6 @@ enum {
     HFV_N_CONDUCTANCE = 0x88,
     HFV_CW_CONDUCTANCE = 32,
     HFV_MOD_CONDUCTANCE = 16,
-    HFV_ADC_READ_COMMAND = ((TestADCReg << 1) & RC522_SPI_ADDRESS_MASK) | RC522_SPI_READ,
     HFV_NFC_A_TX_AUTO = 0x40,
     HFV_NFC_A_MODE = 0x3d,
 };
@@ -107,31 +87,57 @@ enum {
     HFV_TX_HALVES_MAX = 5 + 16 * ISO15693_RESPONSE_MAX + 5,
 };
 
-_Static_assert(HFV_DMA_BANK_COUNT * HFV_DMA_BANK_BYTES + 2 * HFV_DMA_GUARD_BYTES <= RF_HF_SNIFF_BYTES,
-               "SPIM3 banks exceed RF workspace");
+/* LOCKDETECT PPM decode (values measured on device / from the Tonie reference). A PPM tick is 604.13
+ * CPU cycles (= 128/fc at 64 MHz). Half-denominator rounding is intentional. */
+enum {
+    HFV_LOCK_TICK_NUM = 60413,
+    HFV_LOCK_TICK_DEN = 100,
+    HFV_LOCK_TICK_ROUND = 30206,
+    HFV_LOCK_TICK_TOL = 160,
+    HFV_LOCK_SOF_MIN_1OF4 = 2830,
+    HFV_LOCK_SOF_MAX_1OF4 = 3220,
+    HFV_LOCK_SOF_MIN_1OF256 = 4037,
+    HFV_LOCK_SOF_MAX_1OF256 = 4420,
+    HFV_LOCK_SOF_SPLIT = 3500,
+    HFV_LOCK_MERGED_MIN = 1993,
+    HFV_LOCK_MERGED_MAX = 2780,
+    HFV_LOCK_GAP_1OF4 = 19200,
+    HFV_LOCK_GAP_1OF256 = 704000,
+    HFV_LOCK_SOF_TIMEOUT_CYCLES = 640000,       /* ~10 ms with no SOF -> bail, re-check the field */
+    HFV_LOCK_FRAME_TIMEOUT_CYCLES = 1920000,    /* ~30 ms: a real request completes in a few ms */
+    /* Detector timestamp (EOF pause falling edge) to the SOF start at 64 MHz. ISO15693 t1 ~= 320.9 us;
+     * the SOF begins with 56.64 us of silence. DA VALIDARE / tune this one constant with a scope. */
+    HFV_LOCK_RESPONSE_WAIT_CYCLES = 20508,
+    HFV_LOCK_EOF_POSITION = 2,
+    HFV_LOCK_MIN_FRAME_BYTES = 4,
+};
 
-static uint8_t *dma_rx;
+#define HFV_TICK_FROM_CYC(e)   (((uint32_t)(e) * HFV_LOCK_TICK_DEN + HFV_LOCK_TICK_ROUND) / HFV_LOCK_TICK_NUM)
+#define HFV_CYC_FROM_TICK(t)   ((uint32_t)(t) * HFV_LOCK_TICK_NUM / HFV_LOCK_TICK_DEN)
+#define HFV_SYM_IDX(t, c)      (((c) && (t) >= 8u) ? (((t) - 8u) / 512u + 1u) : ((t) / 8u))
+#define HFV_PULSE_POS(t, c)    (((c) && (t) >= 8u) ? (((t) - 8u) % 512u) : ((t) % 8u))
+#define HFV_LOCK_MIN_SYM(c)    ((c) ? HFV_LOCK_MIN_FRAME_BYTES : (HFV_LOCK_MIN_FRAME_BYTES * 4u))
+#define HFV_LOCK_MAX_SYM(c)    ((c) ? (unsigned)HF15_RX_MAX : ((unsigned)HF15_RX_MAX * 4u))
+
 static bool radio_ok;
 static bool reader_open;
 static bool hfv_responded;
 extern bool g_is_reader_antenna_on;
 
-static hf15_rx_t hfv_rx;
-/* DEBUG bring-up: raw ADC-sample ring of the emulation RX, dumped via HF15_EMU_CAPTURE to feed the host
- * codec test with REAL reader waveforms (the synthetic model passes but the device doesn't — tune here). */
+static hf15_rx_t hfv_rx;        /* kept only for the diagnostics counters reported over USB */
+
+/* DEBUG bring-up: LOCKDETECT edge log, dumped via HF15_EMU_CAPTURE to verify the on-device decode
+ * matches the host decoder. 4-byte entries: 31-bit DWT-cycle delta (from receive start) | top bit =
+ * lock state. offset==HFV_CAP_REARM re-arms (unfreeze + reset); the ring freezes once a frame lands. */
 #define HFV_CAP_SIZE 4096u
 #define HFV_CAP_REARM 0xFFFFu
 static uint8_t hfv_cap[HFV_CAP_SIZE];
 static volatile unsigned hfv_cap_wr;
-static volatile bool hfv_cap_frozen;       /* stop writing once a real command burst landed, so the ring holds it */
-static uint16_t hfv_cap_pause_base;        /* pauses counter at the last arm, to detect a real command burst */
-/* offset==HFV_CAP_REARM: re-arm (unfreeze, reset) and return. Else: dump a raw slice at `offset`; the host
- * reorders oldest->newest using *wr_out. Freezes after a BURST of pauses (a real reader command) lands, not on
- * the first noise blip, so the dump holds the strong command burst (see the feed loop). */
+static volatile bool hfv_cap_frozen;
+
 unsigned nfc_hf15_radio_capture(uint8_t *out, unsigned offset, unsigned max, unsigned *wr_out) {
     if (wr_out) { *wr_out = hfv_cap_wr; }
     if (offset == HFV_CAP_REARM) {
-        hfv_cap_pause_base = hfv_rx.pauses;
         hfv_cap_wr = 0;
         hfv_cap_frozen = false;
         return 0;
@@ -142,6 +148,7 @@ unsigned nfc_hf15_radio_capture(uint8_t *out, unsigned offset, unsigned max, uns
     memcpy(out, hfv_cap + offset, k);
     return k;
 }
+
 static uint8_t hfv_reply[ISO15693_RESPONSE_MAX];
 static uint8_t hfv_halves[(HFV_TX_HALVES_MAX + 7) / 8];     /* bit-packed reply, filled before the timed loop */
 static uint16_t hfv_windows, hfv_replies, hfv_late;
@@ -160,7 +167,7 @@ static uint8_t spi_transfer(uint8_t value) {
     NRF_SPI0->TXD = value;
     uint32_t start = DWT->CYCCNT;
     while (!NRF_SPI0->EVENTS_READY) {
-        if (DWT->CYCCNT - start > HFV_SPI_TIMEOUT_CYCLES) {
+        if (DWT->CYCCNT - start > 1000u * HFV_CPU_CYCLES_PER_US) {
             radio_ok = false;
             return 0;
         }
@@ -234,38 +241,25 @@ static void close_reader(void) {
     NRF_SPIM0->ENABLE = 0;
     NRF_SPI0->ENABLE = 0;
     g_is_reader_antenna_on = false;
-    nrf_gpio_pin_clear(READER_POWER);
     nrf_gpio_pin_set(HF_ANT_SEL);
 }
 
-static uint8_t *hfv_dma_at(unsigned bank) {
-    return dma_rx + bank * HFV_DMA_BANK_BYTES;
-}
-
 /* Reply bit stream (1 = subcarrier half-bit), prepared BEFORE the timed loop: computing it inside would
- * eat into the 75-cycle budget between two GPIO toggles. Table driven (a few cycles per byte): it runs
- * between the reader's EOF and the reply, so even a 160-byte reply is ready well inside the ~300 us left. */
+ * eat into the 75-cycle budget between two GPIO toggles. Table driven, runs inside the ~300 us t1 gap. */
 static unsigned hfv_prepare(const uint8_t *data, unsigned length) {
     return hf15_tag_pack(data, length, hfv_halves, sizeof hfv_halves);
 }
 
+/* Load-modulate the packed reply, starting at DWT cycle `reply_at`. RAM function + IRQ disabled by the
+ * caller so the 423.75 kHz subcarrier stays glitch-free. */
 __attribute__((section(".data.hf15"), noinline, aligned(4))) static void
 hfv_transmit(unsigned total, uint32_t reply_at) {
-    /* Active NFCT suppresses this board's GPIO load modulation. */
-    NRF_NFCT->TASKS_DISABLE = 1;
+    NRF_NFCT->TASKS_DISABLE = 1;   /* an active NFCT suppresses this board's GPIO load modulation */
     __DSB();
     uint32_t mask = 1u << (HF_ANT_SEL & 31u);
-    uint32_t deadline = rf_timeslot_deadline() - HFV_WINDOW_CLEANUP_CYCLES;
     uint32_t wait_start = DWT->CYCCNT;
-    for (;;) {
-        NRF_TIMER4->TASKS_CAPTURE[1] = 1;
-        __DSB();
-        if ((int32_t)(NRF_TIMER4->CC[1] - reply_at) >= 0) {
-            break;
-        }
-        if (DWT->CYCCNT - wait_start > HFV_RESPONSE_WAIT_TIMEOUT_CYCLES ||
-            (int32_t)(deadline - DWT->CYCCNT) < 0) {
-            radio_ok = false;
+    while ((int32_t)(DWT->CYCCNT - reply_at) < 0) {
+        if (DWT->CYCCNT - wait_start > HFV_RESPONSE_WAIT_TIMEOUT_CYCLES) {
             return;
         }
     }
@@ -296,251 +290,113 @@ static uint32_t hfv_absence_started;
 static bool hfv_field_known;
 static bool hfv_absence_pending;
 
-/* Returns true when the field appears after being unknown or absent. */
-static bool hfv_probe_field(void) {
-    if (!NRF_NFCT->EVENTS_READY) {
-        return false;
-    }
-    nrf_gpio_pin_set(HF_ANT_SEL);
+static void hfv_nfct_sense_activate(void) {
+    NRF_NFCT->EVENTS_READY = 0;
+    /* No HW auto-collision: the NFCT must never auto-answer a Type-A REQA while it is in SENSE only to
+     * read FIELDPRESENT (otherwise a reader latches a phantom ISO14443-3A tag), as on the ST25TB path. */
+    NRF_NFCT->AUTOCOLRESCONFIG |= NFCT_AUTOCOLRESCONFIG_MODE_Msk;
+    NRF_NFCT->TASKS_SENSE = 1;
+    NRF_NFCT->TASKS_ACTIVATE = 1;
     uint32_t start = DWT->CYCCNT;
-    bool present;
-    do {
-        present = (NRF_NFCT->FIELDPRESENT & 1u) != 0;
-    } while (!present && DWT->CYCCNT - start < HFV_FIELD_PROBE_CYCLES);
-    nrf_gpio_pin_clear(HF_ANT_SEL);
-    if (present) {
-        bool arrived = !hfv_field_known || hfv_absence_pending;
-        hfv_field_known = true;
-        hfv_absence_pending = false;
-        return arrived;
+    while (!NRF_NFCT->EVENTS_READY && DWT->CYCCNT - start < HFV_NFCT_READY_TIMEOUT_CYCLES) {
     }
-    hf15_rx_restart(&hfv_rx);
-    uint32_t now = DWT->CYCCNT;
-    if (hfv_field_known) {
-        if (!hfv_absence_pending) {
-            hfv_absence_started = now;
-            hfv_absence_pending = true;
-        } else if (now - hfv_absence_started > HFV_FIELD_LOSS_CYCLES) {
-            iso15693_model_field_lost();
-            hfv_field_known = false;
-            hfv_absence_pending = false;
-            hfv_responded = false;
+}
+
+/* Decode one reader frame from the NFCT LOCKDETECT edges. Returns 1 with the frame (CRC bytes included)
+ * in frame[0..*len_out) and the EOF falling-edge timestamp in *eof_cyc, or 0 if no frame completed
+ * before the timeout / the field dropped. RAM function so the polling stays tight. IRQ stays on (proven
+ * clean on device); a rare preemption only makes one frame malformed and the reader retries. */
+__attribute__((section(".data.hf15"), noinline, aligned(4))) static int
+hfv_lock_receive(uint8_t *frame, unsigned *len_out, uint32_t *eof_cyc, uint32_t deadline) {
+    uint32_t rx_start = DWT->CYCCNT;
+    uint32_t last_fall = 0, sof_ref = 0;
+    unsigned sym_count = 0;
+    bool prev = (NRF_NFCT->FIELDPRESENT & NFCT_FIELDPRESENT_LOCKDETECT_Msk) != 0;
+    bool sof = false, c256 = false;
+    unsigned w = hfv_cap_frozen ? HFV_CAP_SIZE : 0u;
+    memset(frame, 0, HF15_RX_MAX);
+    while (DWT->CYCCNT - rx_start <
+           (uint32_t)(sof ? HFV_LOCK_FRAME_TIMEOUT_CYCLES : HFV_LOCK_SOF_TIMEOUT_CYCLES)) {
+        /* Never run past the granted timeslot: overrunning it asserts the SoftDevice (reboot). */
+        if ((int32_t)(deadline - DWT->CYCCNT) < (int32_t)HFV_WINDOW_WORK_GUARD_CYCLES) {
+            return 0;
         }
-    }
-    return false;
-}
-
-static const nrfx_timer_t hfv_counter = NRFX_TIMER_INSTANCE(3);
-static const nrfx_timer_t hfv_clock = NRFX_TIMER_INSTANCE(4);
-static nrf_ppi_channel_t hfv_counter_ppi;
-static nrf_ppi_channel_t hfv_start_ppi;
-static bool hfv_start_owned;
-static bool hfv_streaming;
-static unsigned hfv_queued;
-static uint32_t hfv_bank_start[HFV_DMA_BANK_COUNT];
-
-static void hfv_timer_handler(nrf_timer_event_t event, void *context) {
-    (void)event;
-    (void)context;
-}
-
-static void hfv_dma_release(void);
-
-static bool hfv_dma_acquire(void) {
-    nrfx_timer_config_t config = NRFX_TIMER_DEFAULT_CONFIG;
-    config.mode = NRF_TIMER_MODE_COUNTER;
-    config.bit_width = NRF_TIMER_BIT_WIDTH_32;
-    if (nrfx_timer_init(&hfv_counter, &config, hfv_timer_handler) != NRFX_SUCCESS) {
-        return false;
-    }
-    config.mode = NRF_TIMER_MODE_TIMER;
-    config.frequency = NRF_TIMER_FREQ_16MHz;
-    if (nrfx_timer_init(&hfv_clock, &config, hfv_timer_handler) != NRFX_SUCCESS) {
-        nrfx_timer_uninit(&hfv_counter);
-        return false;
-    }
-    if (nrfx_ppi_channel_alloc(&hfv_counter_ppi) != NRFX_SUCCESS) {
-        nrfx_timer_uninit(&hfv_clock);
-        nrfx_timer_uninit(&hfv_counter);
-        return false;
-    }
-    if (nrfx_ppi_channel_assign(hfv_counter_ppi, (uint32_t)&NRF_SPIM3->EVENTS_END,
-                                (uint32_t)&NRF_TIMER3->TASKS_COUNT) != NRFX_SUCCESS ||
-        nrfx_ppi_channel_fork_assign(hfv_counter_ppi, (uint32_t)&NRF_TIMER4->TASKS_CAPTURE[2]) != NRFX_SUCCESS) {
-        hfv_dma_release();
-        return false;
-    }
-    if (nrfx_ppi_channel_alloc(&hfv_start_ppi) != NRFX_SUCCESS) {
-        hfv_dma_release();
-        return false;
-    }
-    hfv_start_owned = true;
-    if (nrfx_ppi_channel_assign(hfv_start_ppi, (uint32_t)&NRF_SPIM3->EVENTS_STARTED,
-                                (uint32_t)&NRF_TIMER4->TASKS_CAPTURE[0]) != NRFX_SUCCESS ||
-        nrfx_ppi_channel_fork_assign(hfv_start_ppi, 0) != NRFX_SUCCESS) {
-        hfv_dma_release();
-        return false;
-    }
-    nrfx_timer_enable(&hfv_clock);
-    nrfx_timer_enable(&hfv_counter);
-    return true;
-}
-
-static void hfv_dma_release(void) {
-    if (hfv_start_owned) {
-        nrfx_ppi_channel_disable(hfv_start_ppi);
-        nrfx_ppi_channel_fork_assign(hfv_start_ppi, 0);
-        nrfx_ppi_channel_free(hfv_start_ppi);
-        hfv_start_owned = false;
-    }
-    nrfx_ppi_channel_disable(hfv_counter_ppi);
-    nrfx_ppi_channel_fork_assign(hfv_counter_ppi, 0);
-    nrfx_ppi_channel_free(hfv_counter_ppi);
-    nrfx_timer_uninit(&hfv_clock);
-    nrfx_timer_uninit(&hfv_counter);
-}
-
-static uint32_t hfv_completed(void) {
-    NRF_TIMER3->TASKS_CAPTURE[0] = 1;
-    __DSB();
-    return NRF_TIMER3->CC[0];
-}
-
-static void hfv_spi_disable(void) {
-    NRF_SPIM3->ENABLE = 0;
-    /* Match the SDK's SPIM3 erratum195 disable sequence. */
-    *(volatile uint32_t *)0x4002f004u = 1;
-}
-
-static void hfv_spi_stop(void) {
-    NRF_SPIM3->SHORTS = 0;
-    nrfx_ppi_channel_disable(hfv_start_ppi);
-    nrfx_ppi_channel_disable(hfv_counter_ppi);
-    if (!hfv_streaming) {
-        nrf_gpio_pin_set(HF_SPI_SELECT);
-        return;
-    }
-    NRF_SPIM3->EVENTS_STOPPED = 0;
-    NRF_SPIM3->TASKS_STOP = 1;
-    uint32_t start = DWT->CYCCNT;
-    while (!NRF_SPIM3->EVENTS_STOPPED) {
-        if (DWT->CYCCNT - start > HFV_DMA_EVENT_TIMEOUT_CYCLES) {
-            radio_ok = false;
-            break;
+        uint32_t now = DWT->CYCCNT;
+        uint32_t fp = NRF_NFCT->FIELDPRESENT;
+        bool cur = (fp & NFCT_FIELDPRESENT_LOCKDETECT_Msk) != 0;
+        if (!(fp & NFCT_FIELDPRESENT_FIELDPRESENT_Msk)) {
+            return 0;   /* field gone */
         }
-    }
-    if (NRF_SPIM3->EVENTS_STOPPED) {
-        hfv_streaming = false;
-    }
-    nrf_gpio_pin_set(HF_SPI_SELECT);
-}
-
-static void hfv_stream_start(void) {
-    if (!radio_ok) {
-        return;
-    }
-    NRF_TIMER3->TASKS_CLEAR = 1;
-    NRF_SPIM3->RXD.PTR = (uint32_t)hfv_dma_at(0);
-    NRF_SPIM3->EVENTS_END = 0;
-    NRF_SPIM3->EVENTS_STARTED = 0;
-    NRF_SPIM3->STALLSTAT = 0;
-    NRF_SPIM3->SHORTS = SPIM_SHORTS_END_START_Msk;
-    if (nrfx_ppi_channel_enable(hfv_counter_ppi) != NRFX_SUCCESS ||
-        nrfx_ppi_channel_enable(hfv_start_ppi) != NRFX_SUCCESS) {
-        radio_ok = false;
-        return;
-    }
-    nrf_gpio_pin_clear(HF_SPI_SELECT);
-    NRF_SPIM3->TASKS_START = 1;
-    hfv_streaming = true;
-    uint32_t start = DWT->CYCCNT;
-    while (!NRF_SPIM3->EVENTS_STARTED) {
-        if (DWT->CYCCNT - start > HFV_DMA_EVENT_TIMEOUT_CYCLES) {
-            radio_ok = false;
-            return;
+        if (prev != cur) {
+            if (w + 4u <= HFV_CAP_SIZE) {
+                uint32_t d = now - rx_start;
+                hfv_cap[w++] = (uint8_t)d;
+                hfv_cap[w++] = (uint8_t)(d >> 8);
+                hfv_cap[w++] = (uint8_t)(d >> 16);
+                hfv_cap[w++] = (uint8_t)(((d >> 24) & 0x7Fu) | (cur ? 0x80u : 0u));
+            }
+            hfv_rx.pauses++;
         }
-    }
-    hfv_bank_start[0] = NRF_TIMER4->CC[0];
-    hfv_queued = 1;
-    NRF_SPIM3->RXD.PTR = (uint32_t)hfv_dma_at(1);
-    NRF_SPIM3->EVENTS_STARTED = 0;
-}
-
-static void hfv_stream_configure(void) {
-    uint8_t *storage = rf_hf_sniff_workspace();
-    dma_rx = storage + HFV_DMA_GUARD_BYTES;
-    memset(storage, 0xa5, HFV_DMA_GUARD_BYTES);
-    memset(dma_rx + HFV_DMA_BANK_COUNT * HFV_DMA_BANK_BYTES, 0xa5, HFV_DMA_GUARD_BYTES);
-    NRF_SPI0->ENABLE = 0;
-    NRF_SPIM0->ENABLE = 0;
-    NRF_SPIM3->PSEL.SCK = HF_SPI_SCK;
-    NRF_SPIM3->PSEL.MOSI = HF_SPI_MOSI;
-    NRF_SPIM3->PSEL.MISO = HF_SPI_MISO;
-    NRF_SPIM3->CONFIG = 0;
-    NRF_SPIM3->FREQUENCY = SPIM_FREQUENCY_FREQUENCY_M8;
-    NRF_SPIM3->ORC = HFV_ADC_READ_COMMAND;
-    /* ORC emits F6 without a TX RAM channel (erratum198). */
-    NRF_SPIM3->TXD.PTR = 0;
-    NRF_SPIM3->TXD.MAXCNT = 0;
-    NRF_SPIM3->TXD.LIST = 0;
-    NRF_SPIM3->RXD.MAXCNT = HFV_DMA_BANK_BYTES;
-    NRF_SPIM3->RXD.LIST = 0;
-    NRF_SPIM3->ENABLE = SPIM_ENABLE_ENABLE_Enabled;
-    hfv_streaming = false;
-    nrf_gpio_cfg(HF_ANT_SEL, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL,
-                 NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
-    nrf_gpio_pin_clear(HF_ANT_SEL);
-}
-
-static unsigned hfv_available(unsigned handled) {
-    uint32_t completed = hfv_completed();
-    if (completed < handled || completed - handled >= HFV_DMA_BANK_COUNT || completed > hfv_queued) {
-        radio_ok = false;
-        return 0;
-    }
-    if (NRF_SPIM3->STALLSTAT) {
-        radio_ok = false;
-        return 0;
-    }
-    if (completed == hfv_queued) {
-        uint32_t start = DWT->CYCCNT;
-        while (!NRF_SPIM3->EVENTS_STARTED) {
-            if (DWT->CYCCNT - start > HFV_DMA_EVENT_TIMEOUT_CYCLES) {
-                radio_ok = false;
-                return 0;
+        /* LOCK can merge two PPM pulses two ticks apart: a short low after a last-position pulse is one
+         * extra zero symbol. */
+        if (!prev && cur && sof && last_fall) {
+            uint32_t low = now - last_fall;
+            uint32_t ft = HFV_TICK_FROM_CYC(last_fall - sof_ref);
+            unsigned fpos = HFV_PULSE_POS(ft, c256);
+            if (low > HFV_LOCK_MERGED_MIN && low < HFV_LOCK_MERGED_MAX &&
+                fpos == (c256 ? 511u : 7u) && sym_count < HFV_LOCK_MAX_SYM(c256)) {
+                sym_count++;
             }
         }
-        uint32_t ended = NRF_TIMER4->CC[2];
-        uint32_t phase = ended - hfv_bank_start[(completed - 1u) % HFV_DMA_BANK_COUNT] -
-                         HFV_DMA_BANK_BYTES * HFV_TIMER_TICKS_PER_US;
-        if (NRF_SPIM3->RXD.AMOUNT != HFV_DMA_BANK_BYTES || phase > HFV_DMA_START_MARGIN_TICKS) {
-            radio_ok = false;
-            return 0;
+        if (prev && !cur) {   /* LOCK falling edge = pause start */
+            uint32_t gap = now - last_fall;
+            if (!sof) {
+                if (last_fall &&
+                    ((gap > HFV_LOCK_SOF_MIN_1OF4 && gap < HFV_LOCK_SOF_MAX_1OF4) ||
+                     (gap > HFV_LOCK_SOF_MIN_1OF256 && gap < HFV_LOCK_SOF_MAX_1OF256))) {
+                    c256 = gap > HFV_LOCK_SOF_SPLIT;
+                    sof_ref = last_fall;
+                    sym_count = 0;
+                    sof = true;
+                    memset(frame, 0, HF15_RX_MAX);
+                }
+            } else {
+                uint32_t el = now - sof_ref;
+                uint32_t pt = HFV_TICK_FROM_CYC(el);
+                uint32_t expc = HFV_CYC_FROM_TICK(pt);
+                uint32_t terr = el > expc ? el - expc : expc - el;
+                unsigned sidx = HFV_SYM_IDX(pt, c256);
+                unsigned pos = HFV_PULSE_POS(pt, c256);
+                if (terr <= HFV_LOCK_TICK_TOL && sidx == sym_count + 1u && (pos & 1u) &&
+                    sym_count < HFV_LOCK_MAX_SYM(c256)) {
+                    if (c256) {
+                        frame[sym_count] = (uint8_t)((pos - 1u) / 2u);
+                    } else {
+                        frame[sym_count / 4u] |= (uint8_t)(((pos - 1u) / 2u) << ((sym_count % 4u) * 2u));
+                    }
+                    sym_count++;
+                } else if (terr <= HFV_LOCK_TICK_TOL && sidx == sym_count + 1u &&
+                           pos == HFV_LOCK_EOF_POSITION && sym_count >= HFV_LOCK_MIN_SYM(c256) &&
+                           (c256 || !(sym_count % 4u))) {
+                    *len_out = c256 ? sym_count : sym_count / 4u;
+                    *eof_cyc = now;
+                    if (w) { hfv_cap_wr = w; hfv_cap_frozen = true; }
+                    return 1;
+                } else {
+                    sof = false;
+                    last_fall = 0;
+                    hfv_rx.errors++;
+                }
+            }
+            last_fall = now;
         }
-        hfv_bank_start[completed % HFV_DMA_BANK_COUNT] = NRF_TIMER4->CC[0];
-        NRF_SPIM3->EVENTS_STARTED = 0;
-        NRF_SPIM3->RXD.PTR = (uint32_t)hfv_dma_at((completed + 1u) % HFV_DMA_BANK_COUNT);
-        hfv_queued = completed + 1u;
-        if (hfv_completed() != completed) {
-            radio_ok = false;
-            return 0;
+        if (sof && now - last_fall > (uint32_t)(c256 ? HFV_LOCK_GAP_1OF256 : HFV_LOCK_GAP_1OF4)) {
+            sof = false;
+            last_fall = 0;
         }
+        prev = cur;
     }
-    if (completed > handled) {
-        return HFV_DMA_BANK_BYTES;
-    }
-    NRF_TIMER4->TASKS_CAPTURE[1] = 1;
-    __DSB();
-    uint32_t elapsed = NRF_TIMER4->CC[1] - hfv_bank_start[handled % HFV_DMA_BANK_COUNT];
-    unsigned bytes = elapsed / HFV_TIMER_TICKS_PER_US;
-    if (bytes > HFV_DMA_BANK_BYTES + HFV_DMA_EVENT_TIMEOUT_CYCLES / HFV_CPU_CYCLES_PER_US) {
-        radio_ok = false;
-        return 0;
-    }
-    if (bytes > HFV_DMA_BANK_BYTES) {
-        bytes = HFV_DMA_BANK_BYTES;
-    }
-    return bytes > HFV_DMA_LAG_BYTES ? bytes - HFV_DMA_LAG_BYTES : 0;
+    return 0;
 }
 
 static void hfv_window_restore(uint32_t interrupts) {
@@ -549,10 +405,6 @@ static void hfv_window_restore(uint32_t interrupts) {
     NRF_NFCT->EVENTS_FIELDDETECTED = 0;
     NRF_NFCT->EVENTS_FIELDLOST = 0;
     NRF_NFCT->INTENSET = interrupts;
-    hfv_spi_disable();
-    hfv_streaming = false;
-    NRF_SPIM3->SHORTS = 0;
-    NRF_SPI0->ENABLE = SPI_ENABLE_ENABLE_Enabled;
     nrf_gpio_cfg_output(HF_ANT_SEL);
     nrf_gpio_pin_set(HF_ANT_SEL);
 }
@@ -565,27 +417,17 @@ static void hfv_window(void) {
     NRF_NFCT->EVENTS_READY = 0;
     NRF_NFCT->EVENTS_FIELDDETECTED = 0;
     NRF_NFCT->EVENTS_FIELDLOST = 0;
-    // No HW auto-collision: the NFCT must never auto-answer a Type-A REQA while it is in SENSE only to
-    // read FIELDPRESENT (otherwise a reader latches a phantom ISO14443-3A tag), as on the ST25TB path.
-    NRF_NFCT->AUTOCOLRESCONFIG |= NFCT_AUTOCOLRESCONFIG_MODE_Msk;
-    NRF_NFCT->TASKS_SENSE = 1;
-    NRF_NFCT->TASKS_ACTIVATE = 1;
-    uint32_t start = DWT->CYCCNT;
-    while (!NRF_NFCT->EVENTS_READY && DWT->CYCCNT - start < HFV_NFCT_READY_TIMEOUT_CYCLES) {
-    }
-    hfv_probe_field();
-    write_register(CommandReg, PCD_RECEIVE);
-    delay_us(HFV_RECEIVE_SETTLE_US);
-    hfv_stream_configure();
-    unsigned handled = 0;
-    unsigned n = 1;                         /* byte 0 of a stream is clocked during the first command */
-    uint32_t last_probe = DWT->CYCCNT;
-    uint32_t field_seen = last_probe;
-    bool field_readable = true;
-    hf15_rx_restart(&hfv_rx);
-    hfv_stream_start();
-    uint32_t sample_origin = hfv_bank_start[0];
+    NRF_NFCT->SHORTS = 0;
+    /* HF_ANT_SEL: strong-drive output, held HIGH = "emulation mode" (HF antenna routed to NFCT) so NFCT
+     * can sense the reader field and LOCKDETECT tracks the pauses (LOW routes the antenna to the RC522,
+     * leaving NFCT blind: NFCTAGSTATE stuck in RAMPUP, FIELDPRESENT = 0). The transmit toggles it to
+     * load-modulate the reply. */
+    nrf_gpio_cfg(HF_ANT_SEL, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL,
+                 NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
+    nrf_gpio_pin_set(HF_ANT_SEL);
+    hfv_nfct_sense_activate();
     uint32_t last_wdt = DWT->CYCCNT;
+    uint8_t frame[HF15_RX_MAX];
     while (radio_ok && (int32_t)(deadline - DWT->CYCCNT) > HFV_WINDOW_WORK_GUARD_CYCLES) {
         if (nrf_gpio_pin_read(BUTTON_1) || nrf_gpio_pin_read(BUTTON_2)) {
             break;
@@ -594,139 +436,69 @@ static void hfv_window(void) {
             bsp_wdt_feed();
             last_wdt = DWT->CYCCNT;
         }
-        unsigned available = hfv_available(handled);
-        if (!radio_ok) {
-            break;
+        if (!NRF_NFCT->EVENTS_READY) {
+            hfv_nfct_sense_activate();
         }
-        if (n == HFV_DMA_BANK_BYTES) {
-            handled++;
-            n = 0;
-            continue;
-        }
-        if (available <= n) {
-            continue;
-        }
-        if (available - n < HFV_MIN_BATCH_BYTES && available != HFV_DMA_BANK_BYTES) {
-            continue;
-        }
-        unsigned ready = handled % HFV_DMA_BANK_COUNT;
-        uint32_t bank_start = hfv_bank_start[ready];
-        unsigned bytes = available - n;
-        if (bytes > HFV_BATCH) {
-            bytes = HFV_BATCH;
-        }
-        uint32_t t_us = (bank_start - sample_origin) / HFV_TIMER_TICKS_PER_US + n;
-        if (!hfv_cap_frozen) {   /* DEBUG: capture the raw ADC bytes into the ring for host-side codec tuning */
-            const uint8_t *csrc = hfv_dma_at(ready) + n;
-            unsigned w = hfv_cap_wr;
-            for (unsigned k = 0; k < bytes; k++) { hfv_cap[w] = csrc[k]; if (++w >= HFV_CAP_SIZE) { w = 0; } }
-            hfv_cap_wr = w;
-        }
-        unsigned used = 0;
-        uint32_t eof_end = 0;
-        hf15_rx_event_t ev = hf15_rx_feed(&hfv_rx, hfv_dma_at(ready) + n, bytes, t_us, &used, &eof_end);
-        /* DEBUG: freeze the capture ring once a BURST of pauses (a real reader command, not a noise blip)
-         * has accumulated since arming, so the 4 ms ring holds the strong command waveform. */
-        if (!hfv_cap_frozen && ((uint16_t)(hfv_rx.pauses - hfv_cap_pause_base) >= 40u || ev == HF15_RX_FRAME)) {
-            hfv_cap_frozen = true;
-        }
-        n += used;
-        bool restart = false;
-        bool replied = false;
-        if (ev != HF15_RX_NONE) {
-            /* Apply the request FIRST (a Write/Lock must land even if we then miss the reply window). */
-            unsigned rlen = ev == HF15_RX_FRAME ? iso15693_model_reply(hfv_rx.data, hfv_rx.len, hfv_reply)
-                                                : iso15693_model_slot_marker(hfv_reply);
-            /* Field presence only from a real reader: a request with a valid CRC, or a slot marker of a
-             * 16-slot round we are in. ADC noise that looks like a lone pause must not wake BLE coexistence,
-             * stop sleep, light the LED or postpone field-lost. */
-            if (rlen || (ev == HF15_RX_FRAME && hf15_check_crc(hfv_rx.data, hfv_rx.len))) {
-                hfv_field_known = true;
-                hfv_absence_pending = false;
-            }
-            unsigned total = rlen ? hfv_prepare(hfv_reply, rlen) : 0u;
-            if (total) {
-                uint32_t eof_tick = sample_origin + eof_end * HFV_TIMER_TICKS_PER_US + HFV_DMA_START_MARGIN_TICKS;
-                uint32_t reply_at = eof_tick + (uint32_t)HFV_REPLY_FIRST_PULSE_US * HFV_TIMER_TICKS_PER_US;
-                NRF_TIMER4->TASKS_CAPTURE[1] = 1;
-                __DSB();
-                bool timely = (int32_t)(reply_at - NRF_TIMER4->CC[1]) >=
-                              (int32_t)(HFV_TX_SETUP_RESERVE_US * HFV_TIMER_TICKS_PER_US);
-                bool fits = (int32_t)(deadline - DWT->CYCCNT) >=
-                            (int32_t)((total * HFV_HALF_BIT_US_CEIL + HFV_REPLY_FIRST_PULSE_US + HFV_TX_GUARD_US) *
-                                      HFV_CPU_CYCLES_PER_US);
-                bool still_timely = false;
-                if (timely && fits && hfv_available(handled)) {
-                    /* hfv_available() may have waited for a DMA bank boundary: check the window again. */
-                    NRF_TIMER4->TASKS_CAPTURE[1] = 1;
-                    __DSB();
-                    still_timely = (int32_t)(reply_at - NRF_TIMER4->CC[1]) >=
-                                   (int32_t)(HFV_TX_SETUP_RESERVE_US * HFV_TIMER_TICKS_PER_US);
+        if (!(NRF_NFCT->FIELDPRESENT & NFCT_FIELDPRESENT_FIELDPRESENT_Msk)) {
+            if (hfv_field_known) {
+                uint32_t now = DWT->CYCCNT;
+                if (!hfv_absence_pending) {
+                    hfv_absence_started = now;
+                    hfv_absence_pending = true;
+                } else if (now - hfv_absence_started > HFV_FIELD_LOSS_CYCLES) {
+                    iso15693_model_field_lost();
+                    hfv_field_known = false;
+                    hfv_absence_pending = false;
+                    hfv_responded = false;
                 }
-                if (still_timely) {
-                    hfv_spi_stop();
-                    if (!radio_ok) {
-                        break;
-                    }
-                    uint32_t irq = __get_PRIMASK();
-                    __disable_irq();
+            }
+            continue;
+        }
+        unsigned flen = 0;
+        uint32_t eof_cyc = 0;
+        /* Receive AND reply run with IRQ disabled so neither the PPM symbol timing nor the 423.75 kHz
+         * subcarrier is jittered by a preemption (BLE / USB), which otherwise corrupts the odd frame and
+         * makes the reader mis-identify the tag. hfv_lock_receive bails at the timeslot deadline, so the
+         * IRQ-off stretch stays bounded inside the granted slot (no SoftDevice overrun). */
+        uint32_t irq = __get_PRIMASK();
+        __disable_irq();
+        int r = hfv_lock_receive(frame, &flen, &eof_cyc, deadline);
+        bool replied = false, got_frame = false;
+        if (r == 1) {
+            got_frame = true;
+            /* iso15693_model_reply verifies the CRC itself and applies writes/locks before replying. */
+            unsigned rlen = iso15693_model_reply(frame, flen, hfv_reply);
+            if (rlen) {
+                unsigned total = hfv_prepare(hfv_reply, rlen);
+                uint32_t reply_at = eof_cyc + HFV_LOCK_RESPONSE_WAIT_CYCLES;
+                uint32_t tx_cost = (reply_at - DWT->CYCCNT) +
+                                   (uint32_t)total * HFV_TX_HALF_PERIODS *
+                                       (HFV_TX_HALF_PERIOD_BASE_CYCLES + 1u) +
+                                   HFV_WINDOW_WORK_GUARD_CYCLES;
+                if (total && (int32_t)(deadline - DWT->CYCCNT) >= (int32_t)tx_cost) {
                     hfv_transmit(total, reply_at);
-                    NRF_NFCT->EVENTS_READY = 0;
-                    NRF_NFCT->AUTOCOLRESCONFIG |= NFCT_AUTOCOLRESCONFIG_MODE_Msk;   // no phantom Type-A on re-sense
-                    NRF_NFCT->TASKS_SENSE = 1;
-                    NRF_NFCT->TASKS_ACTIVATE = 1;
-                    __set_PRIMASK(irq);
-                    hfv_replies++;
-                    last_probe = DWT->CYCCNT;
-                    restart = true;
                     replied = true;
-                } else {
-                    hfv_late++;             /* reply window missed: the reader retries the request */
                 }
             }
         }
-        bool present = hfv_field_known && !hfv_absence_pending;
-        if (NRF_NFCT->FIELDPRESENT & 1u) {
-            field_seen = DWT->CYCCNT;
-        }
-        bool dropped = field_readable && present && DWT->CYCCNT - field_seen > HFV_FIELD_DROP_CYCLES;
-        uint32_t interval = present ? HFV_FIELD_PRESENT_PROBE_CYCLES : HFV_FIELD_ABSENT_PROBE_CYCLES;
-        if (!restart && NRF_NFCT->EVENTS_READY &&
-            (dropped || (DWT->CYCCNT - last_probe > interval && (!present || hf15_rx_idle(&hfv_rx))))) {
-            restart = true;
-        }
-        if (!restart) {
+        __set_PRIMASK(irq);
+        if (!got_frame) {
             continue;
         }
-        hfv_spi_stop();
-        if (!radio_ok) {
-            break;
+        hfv_rx.frames++;
+        /* A valid request means a real reader is present: keep the field state, light the LED, etc. */
+        if (hf15_check_crc(frame, flen)) {
+            hfv_field_known = true;
+            hfv_absence_pending = false;
         }
         if (!replied) {
-            if (hfv_probe_field()) {
-                break;
-            }
-            if (dropped && !hfv_absence_pending) {
-                field_readable = false;
-            }
-            last_probe = DWT->CYCCNT;
+            hfv_late++;
+            continue;
         }
-        handled = 0;
-        n = 1;
-        hf15_rx_restart(&hfv_rx);
-        if (replied) {
-            hf15_rx_settle(&hfv_rx, HFV_RX_SETTLE_SAMPLES);
-        }
-        hfv_stream_start();
-        sample_origin = hfv_bank_start[0];
-        field_seen = DWT->CYCCNT;
-    }
-    hfv_spi_stop();
-    for (unsigned i = 0; i < HFV_DMA_GUARD_BYTES; i++) {
-        if (dma_rx[-(int)HFV_DMA_GUARD_BYTES + (int)i] != 0xa5 ||
-            dma_rx[HFV_DMA_BANK_COUNT * HFV_DMA_BANK_BYTES + i] != 0xa5) {
-            radio_ok = false;
-        }
+        hfv_replies++;
+        /* Back to emulation mode (antenna -> NFCT) and bring NFCT back so LOCKDETECT is live again. */
+        nrf_gpio_pin_set(HF_ANT_SEL);
+        hfv_nfct_sense_activate();
     }
     hfv_window_restore(interrupts);
 }
@@ -740,10 +512,6 @@ bool nfc_hf15_radio_poll(bool *field_present, bool active) {
         open_reader();
         write_register(RFCfgReg, HFV_RF_GAIN);
         reader_open = true;
-    }
-    if (!hfv_dma_acquire()) {
-        nfc_hf15_radio_stop();
-        return false;
     }
     bool ready = radio_ok && (read_register(TxControlReg) & RC522_FIELD_ENABLE_MASK) == 0 && radio_ok;
     bool resume = false;
@@ -772,7 +540,6 @@ bool nfc_hf15_radio_poll(bool *field_present, bool active) {
     }
     *field_present = hfv_field_known || hfv_responded;
     bool sampled = granted && radio_ok;
-    hfv_dma_release();
     if (!ready || !radio_ok || (granted && !*field_present)) {
         close_reader();
         reader_open = false;
@@ -801,7 +568,7 @@ static unsigned put16(uint8_t *o, unsigned n, uint32_t v) {
 }
 
 unsigned nfc_hf15_radio_diag(uint8_t *out, unsigned cap) {
-    if (cap < 20u) return 0;
+    if (cap < 28u) return 0;
     unsigned n = 0;
     n = put16(out, n, hfv_rx.pauses);
     n = put16(out, n, hfv_rx.frames);
@@ -815,6 +582,8 @@ unsigned nfc_hf15_radio_diag(uint8_t *out, unsigned cap) {
     n = put16(out, n, hfv_windows);
     out[n++] = hfv_field_known ? 1u : 0u;
     out[n++] = radio_ok ? 1u : 0u;
+    for (int b = 3; b >= 0; b--) { out[n++] = (uint8_t)(((uint32_t)hfv_rx.zero_i) >> (8 * b)); }
+    for (int b = 3; b >= 0; b--) { out[n++] = (uint8_t)(((uint32_t)hfv_rx.zero_q) >> (8 * b)); }
     return n;
 }
 
@@ -824,5 +593,8 @@ bool nfc_hf15_radio_poll(bool *field_present, bool active) { (void)active; *fiel
 void nfc_hf15_radio_stop(void) {}
 bool nfc_hf15_radio_responded(void) { return false; }
 unsigned nfc_hf15_radio_diag(uint8_t *out, unsigned cap) { (void)out; (void)cap; return 0; }
+unsigned nfc_hf15_radio_capture(uint8_t *out, unsigned offset, unsigned max, unsigned *wr_out) {
+    (void)out; (void)offset; (void)max; if (wr_out) { *wr_out = 0; } return 0;
+}
 
 #endif /* PROJECT_CHAMELEON_ULTRA */
