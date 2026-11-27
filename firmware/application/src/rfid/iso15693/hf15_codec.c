@@ -55,6 +55,8 @@ void hf15_rx_restart(hf15_rx_t *rx) {
 
 void hf15_rx_settle(hf15_rx_t *rx, uint32_t samples) { rx->settle = samples; }
 
+bool hf15_rx_idle(const hf15_rx_t *rx) { return rx->state == RX_IDLE && !rx->in_pause; }
+
 static void rx_begin(hf15_rx_t *rx, uint32_t start, uint32_t end) {
     rx->state = RX_SOF2;
     rx->t0 = start;

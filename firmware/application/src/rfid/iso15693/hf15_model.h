@@ -33,7 +33,9 @@
 #define ISO15693_NXP_SIG_SIZE    32u
 #define ISO15693_NXP_INFO_SIZE   7u
 #define ISO15693_NXP_EXT_SIZE    (ISO15693_NXP_SIG_SIZE + ISO15693_NXP_INFO_SIZE)
-#define ISO15693_IMAGE_MAX       (ISO15693_HEADER_SIZE + ISO15693_MAX_BLOCKS * (ISO15693_MAX_BLOCK_SZ + 1u) + ISO15693_NXP_EXT_SIZE)
+#define ISO15693_MAX_DATA        1024u   /* user memory cap (SLIX 112, SLIX2 320, ICODE DNA 252, Tag-it Plus 256) */
+#define ISO15693_IMAGE_MAX       (ISO15693_HEADER_SIZE + ISO15693_MAX_DATA + ISO15693_MAX_BLOCKS + ISO15693_NXP_EXT_SIZE)
+#define ISO15693_RECORD_MAX      ((ISO15693_IMAGE_MAX + 3u) & ~3u)   /* flash record: image padded to a word */
 #define ISO15693_REQUEST_MAX     64u
 #define ISO15693_RESPONSE_MAX    160u
 #define ISO15693_FLAG_NXP        0x01u
@@ -53,6 +55,7 @@ void iso15693_model_unload(void);
 bool iso15693_model_loaded(void);
 unsigned iso15693_model_image_size(void);
 bool iso15693_model_save(uint8_t *out);         /* copies the current image out; false if not loaded */
+const uint8_t *iso15693_model_image(void);      /* the live image (NULL if not loaded), for read-back */
 void iso15693_model_field_lost(void);           /* reader field gone: state back to Ready */
 
 /* Handle one decoded request (CRC included and verified here). Returns the reply length (CRC

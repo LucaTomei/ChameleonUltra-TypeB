@@ -66,6 +66,8 @@ typedef struct {
 void hf15_rx_reset(hf15_rx_t *rx);              /* full reset (including diagnostics) */
 void hf15_rx_restart(hf15_rx_t *rx);            /* new window: keep diagnostics, drop decode state */
 void hf15_rx_settle(hf15_rx_t *rx, uint32_t samples);
+/* True when no request is being received (safe moment to pause sampling, e.g. to probe the field). */
+bool hf15_rx_idle(const hf15_rx_t *rx);
 /* Feed `n` samples, samples[0] taken at `t_us` (1 sample per us). Stops at the first event and returns
  * it; `*consumed` = samples used (up to and including the one that completed the event) and
  * `*eof_end_us` = time of the rising edge that ended the EOF (the reference for the reply delay). */

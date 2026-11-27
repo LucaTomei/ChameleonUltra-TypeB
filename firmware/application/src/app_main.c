@@ -44,6 +44,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "settings.h"
 #include "nfc_poll.h"       // field-triggered 16-slot polling (DA VALIDARE su device)
 #include "nfc_st25tb.h"     // ST25TB / SRIx (NFC-B) emulation service (vendored, GPL-3.0)
+#include "nfc_hf15.h"       // ISO15693 / NFC-V emulation service (DA VALIDARE su device)
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "rc522.h"
@@ -1202,6 +1203,8 @@ int main(void) {
         // ST25TB / SRIx (NFC-B) emulation service: no-op unless the active slot is ST25TB and
         // we are in tag mode; otherwise it drives the field-detect + RF listening windows.
         nfc_st25tb_service();
+        // ISO15693 / NFC-V emulation service: same contract (no-op unless the active slot is NFC-V).
+        nfc_hf15_service();
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
         // Field generator rainbow animation

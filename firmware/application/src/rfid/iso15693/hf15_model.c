@@ -38,6 +38,7 @@ unsigned iso15693_model_image_size_for(const uint8_t *h, unsigned available) {
     if (!h || available < ISO15693_HEADER_SIZE || h[0] != ISO15693_IMAGE_VERSION || h[1] != 0xE0) return 0;
     unsigned bs = h[12], bc = (unsigned)h[13] | ((unsigned)h[14] << 8);
     if (bs < 1u || bs > ISO15693_MAX_BLOCK_SZ || bc < 1u || bc > ISO15693_MAX_BLOCKS) return 0;
+    if (bc * bs > ISO15693_MAX_DATA) return 0;
     if (h[15] & ~ISO15693_FLAG_NXP) return 0;                 /* unknown flag bits: refuse */
     unsigned size = ISO15693_HEADER_SIZE + bc * bs + bc + ((h[15] & ISO15693_FLAG_NXP) ? ISO15693_NXP_EXT_SIZE : 0u);
     return size <= available && size <= ISO15693_IMAGE_MAX ? size : 0u;
@@ -46,7 +47,8 @@ unsigned iso15693_model_image_size_for(const uint8_t *h, unsigned available) {
 unsigned iso15693_model_build_image(uint8_t *out, unsigned cap, const uint8_t uid[8], uint8_t dsfid, uint8_t afi,
                                     uint8_t ic_ref, unsigned bs, unsigned bc, const uint8_t *blocks,
                                     const uint8_t *security) {
-    if (!out || !uid || uid[0] != 0xE0 || bs < 1u || bs > ISO15693_MAX_BLOCK_SZ || bc < 1u || bc > ISO15693_MAX_BLOCKS)
+    if (!out || !uid || uid[0] != 0xE0 || bs < 1u || bs > ISO15693_MAX_BLOCK_SZ || bc < 1u || bc > ISO15693_MAX_BLOCKS ||
+            bc * bs > ISO15693_MAX_DATA)
         return 0;
     unsigned size = ISO15693_HEADER_SIZE + bc * bs + bc;
     if (size > cap) return 0;
@@ -84,6 +86,8 @@ bool iso15693_model_save(uint8_t *out) {
     memcpy(out, image, img_size);
     return true;
 }
+
+const uint8_t *iso15693_model_image(void) { return loaded ? image : NULL; }
 
 bool iso15693_model_load(const uint8_t *data, unsigned image_bytes) {
     unsigned size = iso15693_model_image_size_for(data, image_bytes);
