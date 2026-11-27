@@ -47,10 +47,12 @@ enum {
     HFV_NFCT_READY_TIMEOUT_CYCLES = 100 * HFV_CPU_CYCLES_PER_US,
     HFV_WINDOW_CLEANUP_CYCLES = 2000 * HFV_CPU_CYCLES_PER_US,
     HFV_WINDOW_WORK_GUARD_CYCLES = 2000 * HFV_CPU_CYCLES_PER_US,
-    /* ISO15693 t1 = 4352/fc = 320.9 us to the SOF; the SOF's first 56.64 us are unmodulated, so the first
-     * subcarrier pulse goes 311.5 + 56.6 us after the rising edge ending the reader's EOF pause (Proxmark
-     * DELAY_ISO15693_VCD_TO_VICC_SIM + its 3-half SOF lead). DA VALIDARE: tune if a reader misses us. */
-    HFV_REPLY_FIRST_PULSE_US = 368,
+    /* ISO15693 t1 = 4352/fc = 320.9 us (+-2.4 us) from the rising edge ending the reader's EOF pause to
+     * the start of our SOF, whose first 3 halves (56.64 us) are unmodulated: the transmitted stream starts
+     * at the first subcarrier pulse (k_sof = S S S U S), nominally 377.5 us after that edge. eof_end is
+     * stamped ~1 us early (first carrier sample) and the TX start adds ~2.5 us (start margin + capture):
+     * 374 lands the first pulse on the nominal. DA VALIDARE: tune if a reader misses us. */
+    HFV_REPLY_FIRST_PULSE_US = 374,
     HFV_RESPONSE_WAIT_TIMEOUT_CYCLES = 1000 * HFV_CPU_CYCLES_PER_US,
     HFV_FIELD_PROBE_CYCLES = 100 * HFV_CPU_CYCLES_PER_US,
     HFV_FIELD_LOSS_CYCLES = 3000 * HFV_CPU_CYCLES_PER_US,
@@ -215,15 +217,10 @@ static uint8_t *hfv_dma_at(unsigned bank) {
 }
 
 /* Reply bit stream (1 = subcarrier half-bit), prepared BEFORE the timed loop: computing it inside would
- * eat into the 75-cycle budget between two GPIO toggles. */
+ * eat into the 75-cycle budget between two GPIO toggles. Table driven (a few cycles per byte): it runs
+ * between the reader's EOF and the reply, so even a 160-byte reply is ready well inside the ~300 us left. */
 static unsigned hfv_prepare(const uint8_t *data, unsigned length) {
-    unsigned total = hf15_tag_halfbit_count(length);
-    if (total > HFV_TX_HALVES_MAX) return 0;
-    memset(hfv_halves, 0, (total + 7u) / 8u);
-    for (unsigned h = 0; h < total; h++) {
-        if (hf15_tag_halfbit(data, length, h)) hfv_halves[h >> 3] |= (uint8_t)(1u << (h & 7u));
-    }
-    return total;
+    return hf15_tag_pack(data, length, hfv_halves, sizeof hfv_halves);
 }
 
 __attribute__((section(".data.hf15"), noinline, aligned(4))) static void
@@ -600,11 +597,16 @@ static void hfv_window(void) {
         bool restart = false;
         bool replied = false;
         if (ev != HF15_RX_NONE) {
-            hfv_field_known = true;
-            hfv_absence_pending = false;
             /* Apply the request FIRST (a Write/Lock must land even if we then miss the reply window). */
             unsigned rlen = ev == HF15_RX_FRAME ? iso15693_model_reply(hfv_rx.data, hfv_rx.len, hfv_reply)
                                                 : iso15693_model_slot_marker(hfv_reply);
+            /* Field presence only from a real reader: a request with a valid CRC, or a slot marker of a
+             * 16-slot round we are in. ADC noise that looks like a lone pause must not wake BLE coexistence,
+             * stop sleep, light the LED or postpone field-lost. */
+            if (rlen || (ev == HF15_RX_FRAME && hf15_check_crc(hfv_rx.data, hfv_rx.len))) {
+                hfv_field_known = true;
+                hfv_absence_pending = false;
+            }
             unsigned total = rlen ? hfv_prepare(hfv_reply, rlen) : 0u;
             if (total) {
                 uint32_t eof_tick = sample_origin + eof_end * HFV_TIMER_TICKS_PER_US + HFV_DMA_START_MARGIN_TICKS;
@@ -616,7 +618,15 @@ static void hfv_window(void) {
                 bool fits = (int32_t)(deadline - DWT->CYCCNT) >=
                             (int32_t)((total * HFV_HALF_BIT_US_CEIL + HFV_REPLY_FIRST_PULSE_US + HFV_TX_GUARD_US) *
                                       HFV_CPU_CYCLES_PER_US);
+                bool still_timely = false;
                 if (timely && fits && hfv_available(handled)) {
+                    /* hfv_available() may have waited for a DMA bank boundary: check the window again. */
+                    NRF_TIMER4->TASKS_CAPTURE[1] = 1;
+                    __DSB();
+                    still_timely = (int32_t)(reply_at - NRF_TIMER4->CC[1]) >=
+                                   (int32_t)(HFV_TX_SETUP_RESERVE_US * HFV_TIMER_TICKS_PER_US);
+                }
+                if (still_timely) {
                     hfv_spi_stop();
                     if (!radio_ok) {
                         break;

@@ -2,6 +2,7 @@
 /* ISO/IEC 15693 (NFC-V) tag emulation model. See hf15_model.h for the image layout. */
 #include "hf15_model.h"
 #include "frame.h"
+#include "hf15_codec.h"
 #include <string.h>
 
 /* Request flag bits (ISO15693-3 §7.3.1); bits 4..6 change meaning when the Inventory flag is set. */
@@ -114,7 +115,7 @@ static unsigned put_uid(uint8_t *r, unsigned n) {
 static unsigned error_reply(uint8_t *r, uint8_t code) {
     r[0] = 0x01;
     r[1] = code;
-    iso15693_append_crc(r, 2);
+    hf15_append_crc(r, 2u);
     return 4;
 }
 
@@ -123,7 +124,7 @@ static unsigned inventory_reply(uint8_t *r) {
     r[n++] = 0x00;
     r[n++] = image[9];                      /* DSFID */
     n = put_uid(r, n);
-    iso15693_append_crc(r, (uint16_t)n);
+    hf15_append_crc(r, n);
     return n + 2;
 }
 
@@ -158,7 +159,7 @@ unsigned iso15693_model_slot_marker(uint8_t reply[ISO15693_RESPONSE_MAX]) {
 }
 
 unsigned iso15693_model_reply(const uint8_t *f, unsigned length, uint8_t reply[ISO15693_RESPONSE_MAX]) {
-    if (!loaded || length < 4u || length > ISO15693_REQUEST_MAX || !iso15693_check_crc(f, (uint16_t)length))
+    if (!loaded || length < 4u || length > ISO15693_REQUEST_MAX || !hf15_check_crc(f, length))
         return 0;
     pending_slot = -1;                      /* any new request ends a pending 16-slot round */
     unsigned plen = length - 2u;
@@ -282,6 +283,6 @@ unsigned iso15693_model_reply(const uint8_t *f, unsigned length, uint8_t reply[I
     default:
         return error_reply(reply, ERR_NOT_SUPPORTED);
     }
-    iso15693_append_crc(reply, (uint16_t)n);
+    hf15_append_crc(reply, n);
     return n + 2u;
 }

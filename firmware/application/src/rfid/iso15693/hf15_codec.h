@@ -29,6 +29,13 @@
 
 /* Number of half-bits (each H long) of the response for `len` payload bytes: SOF + 16/byte + EOF. */
 unsigned hf15_tag_halfbit_count(unsigned len);
+/* The same half-bit stream, bit-packed LSB-first into out[] (bit h = half-bit h), table driven: fast
+ * enough to run between a request's EOF and the reply. Returns the half-bit count, 0 if it does not fit. */
+unsigned hf15_tag_pack(const uint8_t *data, unsigned len, uint8_t *out, unsigned out_bytes);
+/* ISO15693 CRC-16 (same result as iso15693_crc16 in frame.c), nibble-table driven for the reply path. */
+uint16_t hf15_crc16(const uint8_t *data, unsigned len);
+void hf15_append_crc(uint8_t *data, unsigned len);          /* writes 2 CRC bytes (LSB, MSB) at data[len] */
+bool hf15_check_crc(const uint8_t *data, unsigned len);     /* len includes the 2 CRC bytes */
 /* Half-bit `index` of the response: 1 = subcarrier (S), 0 = unmodulated (U). The 56.64 us unmodulated
  * lead of the SOF is NOT included (it is part of the response delay). */
 uint8_t hf15_tag_halfbit(const uint8_t *data, unsigned len, unsigned index);
@@ -61,6 +68,10 @@ typedef struct {
     uint8_t  last_error;     /* 1 bad position, 2 missed symbol, 3 overflow, 4 short frame, 5 timeout, 6 gap */
     uint8_t  peak_level;     /* highest carrier magnitude seen */
     uint32_t last_pause_us, last_pause_len;
+    /* ADC zero (the no-carrier reading), LSB x256, learnt inside deep 100% OOK pauses: magnitudes are
+     * measured from it, so a DC offset of the RC522 ADC does not hide the pauses. 0 = ideal ADC. */
+    int32_t  zero_i, zero_q;
+    bool     sof_fresh;      /* the pending lone pause came from idle (not from a decode error) */
 } hf15_rx_t;
 
 void hf15_rx_reset(hf15_rx_t *rx);              /* full reset (including diagnostics) */

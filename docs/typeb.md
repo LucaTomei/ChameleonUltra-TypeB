@@ -175,3 +175,19 @@ packages (`ultra-dfu-app.zip`, ...) and the CLI clients for Linux, macOS and Win
   (`CWGsPReg`, `GsNReg`, one TX driver off) and keeps the working one for the session. Tested
   15/15 with the tag offset by 1 cm, lifted a few millimetres and rotated by 90 degrees.
 - Slow: every exchange goes through USB and host-side demodulation.
+
+## NFC-V (ISO15693) — sperimentale, DA VALIDARE su device
+
+Software radio on the same HF hardware as the ST25TB emulation (RC522 field-off ADC sampling +
+GPIO load modulation), commands `2300`-`2303`, slot tag type `2100`. Ultra only.
+
+- Reader → tag: only **100% OOK** requests are decoded (Flipper Zero, phones, Proxmark). 10% ASK
+  readers are not seen: on the 4-bit RC522 ADC a 10% dip is below the noise.
+- Tag → reader: high data rate, one subcarrier (fc/32). A request asking for the low data rate or
+  two subcarriers gets the high-rate reply anyway (most readers use the high rate).
+- Replies up to 160 bytes (Read Multiple Blocks of up to ~38 four-byte blocks per request); a bigger
+  request gets error `0x0F`.
+- The emulation decoder learns the ADC zero inside the reader's pauses, so a small DC offset of the
+  ADC does not hide them; `HF15_EMU_DIAG` reports pauses/frames/replies/late to tune on hardware.
+- The Chameleon reader reads replies up to ~27 bytes per request (single-block reads are used).
+- Not modelled: SLIX passwords / privacy mode, AFI family matching, the Write/Lock option flag.

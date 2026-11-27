@@ -69,7 +69,7 @@ static void test_reader_encoder_vs_flipper(void) {
 }
 
 /* ---- synthesise RC522 field-off ADC samples of a VCD request (emulation side) ---- */
-typedef struct { double amp, phase, beat_hz, noise; int ramp; } field_t;
+typedef struct { double amp, phase, beat_hz, noise; int ramp; int di, dq; } field_t;   /* di/dq: ADC DC offset */
 
 static uint8_t pack(int i, int q) {
     if (i > 7) i = 7; if (i < -8) i = -8; if (q > 7) q = 7; if (q < -8) q = -8;
@@ -97,8 +97,8 @@ static unsigned synth_request(const uint8_t *per, unsigned np, double lead_us, d
             if (idx > 0 && idx < np && per[idx - 1] && rel - idx * P < 1.0) a *= 0.5;
         }
         double ph = f->phase + 2 * M_PI * f->beat_hz * t * 1e-6;
-        int I = (int)lround(a * cos(ph) + (frnd() - 0.5) * 2 * f->noise);
-        int Q = (int)lround(a * sin(ph) + (frnd() - 0.5) * 2 * f->noise);
+        int I = (int)lround(f->di + a * cos(ph) + (frnd() - 0.5) * 2 * f->noise);
+        int Q = (int)lround(f->dq + a * sin(ph) + (frnd() - 0.5) * 2 * f->noise);
         out[k] = pack(I, Q);
     }
     /* time of the rising edge ending the EOF pause */
@@ -277,6 +277,91 @@ static void test_full_loop(void) {
     }
 }
 
+/* ---- the fast reply path must produce exactly the reference bit stream and CRC ---- */
+static void test_pack_and_crc(void) {
+    static uint8_t data[ISO15693_RESPONSE_MAX], packed[(5 + 16 * ISO15693_RESPONSE_MAX + 5 + 7) / 8];
+    int bad = 0;
+    for (unsigned len = 0; len <= ISO15693_RESPONSE_MAX; len++) {
+        for (unsigned i = 0; i < len; i++) data[i] = (uint8_t)rnd(0, 255);
+        memset(packed, 0xEE, sizeof packed);
+        unsigned total = hf15_tag_pack(data, len, packed, sizeof packed);
+        if (total != hf15_tag_halfbit_count(len)) { bad++; continue; }
+        for (unsigned h = 0; h < total; h++)
+            if (((packed[h >> 3] >> (h & 7u)) & 1u) != hf15_tag_halfbit(data, len, h)) { bad++; break; }
+        if (hf15_crc16(data, len) != iso15693_crc16(data, (uint16_t)len)) bad++;
+    }
+    CHECK(bad == 0, "fast pack/CRC differ from the reference in %d cases", bad);
+    CHECK(hf15_tag_pack(data, 4, packed, 9) == 0, "pack must refuse a too-small buffer");
+}
+
+/* ---- an RC522 ADC with a DC offset: the decoder learns the zero inside the pauses ---- */
+static void test_emulation_rx_dc_offset(void) {
+    static uint8_t s[40000];
+    static const int off[][2] = {{0, 0}, {1, 0}, {1, -1}, {-1, 1}, {2, 0}, {0, -2}};
+    for (unsigned o = 0; o < sizeof off / sizeof off[0]; o++) {
+        hf15_rx_t rx; hf15_rx_reset(&rx);            /* one receiver for the whole session, like the radio */
+        int ok = 0, total = 0;
+        for (unsigned rep = 0; rep < 40; rep++) {
+            uint8_t req[8] = {0x26, 0x01, 0x00};
+            iso15693_append_crc(req, 3);
+            uint8_t per[200]; unsigned np = hf15_reader_period_count(5);
+            for (unsigned i = 0; i < np; i++) per[i] = hf15_reader_period(req, 5, i);
+            field_t fd = {.amp = 3.5 + frnd() * 4.0, .phase = frnd() * 6.283, .beat_hz = 200 + frnd() * 3000,
+                          .noise = 0.8, .ramp = 0, .di = off[o][0], .dq = off[o][1]};
+            double rise; unsigned n = synth_request(per, np, 60, 400, &fd, s, sizeof s, &rise);
+            hf15_rx_restart(&rx);
+            uint32_t eof_end = 0; unsigned at = 0;
+            hf15_rx_event_t ev = feed_batched(&rx, s, n, &eof_end, &at);
+            if (rep >= 8) {                            /* after a short warm-up */
+                total++;
+                if (ev == HF15_RX_FRAME && rx.len == 5 && memcmp(rx.data, req, 5) == 0) ok++;
+            }
+        }
+        CHECK(ok * 100 >= total * 95, "offset (%d,%d): decoded %d/%d after warm-up (zero %d,%d)",
+              off[o][0], off[o][1], ok, total, (int)rx.zero_i, (int)rx.zero_q);
+        if (o == 0) CHECK(abs(rx.zero_i) <= 64 && abs(rx.zero_q) <= 64, "ideal ADC: zero drifted to %d,%d (x256)", (int)rx.zero_i, (int)rx.zero_q);
+    }
+}
+
+/* ---- a broken request must not produce "EOF-only" slot markers (16-slot inventory would shift) ---- */
+static void test_no_fake_eof_only(void) {
+    static uint8_t s[40000];
+    uint8_t req[24] = {0x22, 0x20, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x07, 0xE0, 0x03};
+    iso15693_append_crc(req, 11);
+    uint8_t per[600]; unsigned np = hf15_reader_period_count(13);
+    for (unsigned i = 0; i < np; i++) per[i] = hf15_reader_period(req, 13, i);
+    for (unsigned i = 40; i < np; i++) if (per[i]) { per[i] = 0; per[i + 1] = 1; break; }   /* one pause +1 P */
+    field_t fd = {.amp = 5, .phase = 0.4, .beat_hz = 700, .noise = 0.7};
+    double rise; unsigned n = synth_request(per, np, 60, 600, &fd, s, sizeof s, &rise);
+    hf15_rx_t rx; hf15_rx_reset(&rx);
+    uint32_t eof_end = 0; unsigned at = 0;
+    hf15_rx_event_t ev;
+    unsigned pos = 0, events = 0;
+    while (pos < n) {                                   /* run to the end, counting every event */
+        ev = feed_batched(&rx, s + pos, n - pos, &eof_end, &at);
+        pos += at;
+        if (ev != HF15_RX_NONE) events++;
+        if (at == 0) break;
+    }
+    CHECK(events == 0 && rx.eof_only == 0, "broken request produced %u events, eof_only=%u", events, rx.eof_only);
+}
+
+/* ---- reader: a burst before the reply (switch-on transient, interference) must not hide it ---- */
+static void test_reader_burst_before_reply(void) {
+    static uint8_t s[12000];
+    int ok = 0;
+    for (unsigned rep = 0; rep < 30; rep++) {
+        uint8_t resp[16] = {0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x07, 0xE0};
+        resp[3] = (uint8_t)rep;
+        iso15693_append_crc(resp, 10);
+        unsigned n = synth_response(resp, 12, 1.0025, 380, 2.5 + frnd() * 2.0, frnd() * 6.283, 0.6, s, sizeof s);
+        for (unsigned k = 100; k < 160; k++) s[k] = pack(rnd(-4, 4), rnd(-4, 4));   /* 60-sample burst */
+        uint8_t out[32]; unsigned olen = 0;
+        if (hf15_tag_decode(s, n, 65700, out, sizeof out, &olen, NULL) && olen == 12 && memcmp(out, resp, 12) == 0) ok++;
+    }
+    CHECK(ok == 30, "reply after a burst decoded %d/30", ok);
+}
+
 int main(void) {
     test_tag_encoder_vs_flipper();
     test_reader_encoder_vs_flipper();
@@ -284,6 +369,11 @@ int main(void) {
     test_emulation_rx_256_and_eof_only();
     test_reader_rx();
     test_full_loop();
+    /* added later: run after the original ones so their random sequence (and results) is unchanged */
+    test_pack_and_crc();
+    test_emulation_rx_dc_offset();
+    test_no_fake_eof_only();
+    test_reader_burst_before_reply();
     printf("%s: %d/%d checks passed\n", failures ? "FAILED" : "ALL CODEC TESTS PASSED", checks - failures, checks);
     return failures ? 1 : 0;
 }

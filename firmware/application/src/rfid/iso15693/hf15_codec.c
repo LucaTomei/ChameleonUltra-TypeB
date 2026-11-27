@@ -24,6 +24,64 @@ uint8_t hf15_tag_halfbit(const uint8_t *data, unsigned len, unsigned index) {
     return index < 5u ? k_eof[index] : 0u;
 }
 
+/* Manchester of one nibble, LSB-first: bit v -> halves (v ? 0,1 : 1,0) -> 2 bits per payload bit. */
+static const uint8_t k_manchester_nibble[16] = {
+    0x55, 0x56, 0x59, 0x5a, 0x65, 0x66, 0x69, 0x6a, 0x95, 0x96, 0x99, 0x9a, 0xa5, 0xa6, 0xa9, 0xaa,
+};
+
+unsigned hf15_tag_pack(const uint8_t *data, unsigned len, uint8_t *out, unsigned out_bytes) {
+    unsigned total = hf15_tag_halfbit_count(len);
+    if ((total + 7u) / 8u > out_bytes) return 0;
+    uint32_t acc = 0x17u;                          /* SOF S S S U S, half 0 in bit 0 */
+    unsigned nbits = 5u, o = 0;
+    for (unsigned i = 0; i < len; i++) {
+        uint32_t w = (uint32_t)k_manchester_nibble[data[i] & 15u] |
+                     ((uint32_t)k_manchester_nibble[data[i] >> 4] << 8);
+        acc |= w << nbits;
+        nbits += 16u;
+        while (nbits >= 8u) {
+            out[o++] = (uint8_t)acc;
+            acc >>= 8;
+            nbits -= 8u;
+        }
+    }
+    acc |= 0x1du << nbits;                          /* EOF S U S S S */
+    nbits += 5u;
+    while (nbits) {
+        out[o++] = (uint8_t)acc;
+        acc >>= 8;
+        nbits = nbits > 8u ? nbits - 8u : 0u;
+    }
+    return total;
+}
+
+static const uint16_t k_crc_nibble[16] = {           /* reflected poly 0x8408, one nibble per step */
+    0x0000, 0x1081, 0x2102, 0x3183, 0x4204, 0x5285, 0x6306, 0x7387,
+    0x8408, 0x9489, 0xa50a, 0xb58b, 0xc60c, 0xd68d, 0xe70e, 0xf78f,
+};
+
+uint16_t hf15_crc16(const uint8_t *data, unsigned len) {
+    uint16_t crc = 0xffffu;
+    for (unsigned i = 0; i < len; i++) {
+        crc ^= data[i];
+        crc = (uint16_t)((crc >> 4) ^ k_crc_nibble[crc & 15u]);
+        crc = (uint16_t)((crc >> 4) ^ k_crc_nibble[crc & 15u]);
+    }
+    return (uint16_t)~crc;
+}
+
+void hf15_append_crc(uint8_t *data, unsigned len) {
+    uint16_t crc = hf15_crc16(data, len);
+    data[len] = (uint8_t)crc;
+    data[len + 1] = (uint8_t)(crc >> 8);
+}
+
+bool hf15_check_crc(const uint8_t *data, unsigned len) {
+    if (len < 2u) return false;
+    uint16_t crc = hf15_crc16(data, len - 2u);
+    return data[len - 2u] == (uint8_t)crc && data[len - 1u] == (uint8_t)(crc >> 8);
+}
+
 /* ================================================================ VCD -> VICC decoder (emulation RX) */
 
 enum { RX_IDLE, RX_SOF2, RX_DATA4, RX_DATA256 };
@@ -37,10 +95,22 @@ enum { RX_IDLE, RX_SOF2, RX_DATA4, RX_DATA256 };
 #define RX_EXIT_ABOVE    2u                       /* consecutive high samples to leave it */
 #define P_Q8             ((int32_t)HF15_P_Q8)
 
-static inline unsigned mag(uint8_t s) {
-    int i = (int8_t)s >> 4;                       /* signed I nibble (bits 7..4) */
-    int q = (int8_t)(uint8_t)(s << 4) >> 4;       /* signed Q nibble (bits 3..0) */
-    return (unsigned)((i < 0 ? -i : i) + (q < 0 ? -q : q));
+#define RX_ZERO_MAX_Q8   (3 * 256)                /* the learnt ADC zero stays within +-3 LSB per axis */
+
+/* |I - zero_i| + |Q - zero_q| x16: the carrier magnitude measured from the ADC's no-carrier reading. */
+static inline int32_t mag16(const hf15_rx_t *rx, uint8_t s) {
+    int32_t i = ((int32_t)((int8_t)s >> 4)) * 16 - rx->zero_i / 16;              /* signed I nibble (7..4) */
+    int32_t q = ((int32_t)((int8_t)(uint8_t)(s << 4) >> 4)) * 16 - rx->zero_q / 16;   /* signed Q (3..0) */
+    return (i < 0 ? -i : i) + (q < 0 ? -q : q);
+}
+
+/* Inside a deep pause (100% OOK: below a quarter of the carrier) the ADC reads its own zero: track it
+ * slowly per axis. Shallower pauses (ASK) are not used, they would pull the zero towards the carrier. */
+static inline void learn_zero(hf15_rx_t *rx, uint8_t s) {
+    int32_t i = ((int32_t)((int8_t)s >> 4)) * 256, q = ((int32_t)((int8_t)(uint8_t)(s << 4) >> 4)) * 256;
+    int32_t zi = rx->zero_i + (i - rx->zero_i) / 32, zq = rx->zero_q + (q - rx->zero_q) / 32;
+    rx->zero_i = zi > RX_ZERO_MAX_Q8 ? RX_ZERO_MAX_Q8 : zi < -RX_ZERO_MAX_Q8 ? -RX_ZERO_MAX_Q8 : zi;
+    rx->zero_q = zq > RX_ZERO_MAX_Q8 ? RX_ZERO_MAX_Q8 : zq < -RX_ZERO_MAX_Q8 ? -RX_ZERO_MAX_Q8 : zq;
 }
 
 void hf15_rx_reset(hf15_rx_t *rx) { memset(rx, 0, sizeof(*rx)); }
@@ -51,22 +121,26 @@ void hf15_rx_restart(hf15_rx_t *rx) {
     rx->pauses = keep.pauses; rx->frames = keep.frames; rx->errors = keep.errors;
     rx->eof_only = keep.eof_only; rx->last_error = keep.last_error; rx->peak_level = keep.peak_level;
     rx->last_pause_us = keep.last_pause_us; rx->last_pause_len = keep.last_pause_len;
+    rx->zero_i = keep.zero_i; rx->zero_q = keep.zero_q;     /* a property of the ADC, not of the window */
 }
 
 void hf15_rx_settle(hf15_rx_t *rx, uint32_t samples) { rx->settle = samples; }
 
 bool hf15_rx_idle(const hf15_rx_t *rx) { return rx->state == RX_IDLE && !rx->in_pause; }
 
-static void rx_begin(hf15_rx_t *rx, uint32_t start, uint32_t end) {
+static void rx_begin(hf15_rx_t *rx, uint32_t start, uint32_t end, bool fresh) {
     rx->state = RX_SOF2;
     rx->t0 = start;
     rx->t0_end = end;
+    rx->sof_fresh = fresh;
 }
 
 static hf15_rx_event_t rx_error(hf15_rx_t *rx, uint8_t code, uint32_t start, uint32_t end) {
     rx->errors++;
     rx->last_error = code;
-    rx_begin(rx, start, end);                     /* this pause may be the start of a new SOF */
+    /* This pause may be the start of a new SOF, but if nothing follows it is NOT an EOF-only frame:
+     * after a broken request, gaps of up to 14 periods (and the request's own EOF) are normal. */
+    rx_begin(rx, start, end, false);
     return HF15_RX_NONE;
 }
 
@@ -91,14 +165,21 @@ static unsigned nearest_period(int32_t w_q8, int32_t *resid) {
 
 static inline int32_t absdiff(int32_t a) { return a < 0 ? -a : a; }
 
+/* A lone pause is a slot marker (EOF-only frame) only after real silence: inside a 1-out-of-4 frame the
+ * gap between two pauses is at most 14 periods, and a 16-slot round leaves >= t1 (~34 P) between markers. */
+#define RX_MARKER_QUIET_Q8 (20 * P_Q8)
+
 hf15_rx_event_t hf15_rx_pause(hf15_rx_t *rx, uint32_t start, uint32_t end) {
+    uint32_t prev_end = rx->last_pause_us + rx->last_pause_len;
+    bool quiet = rx->pauses == 0 || (int32_t)((start - prev_end) * 256u) > RX_MARKER_QUIET_Q8 ||
+                 start < prev_end;                 /* new window: times restart from 0 */
     rx->pauses++;
     rx->last_pause_us = start;
     rx->last_pause_len = end - start;
     int32_t s_q8 = (int32_t)(start * 256u);
     switch (rx->state) {
     case RX_IDLE:
-        rx_begin(rx, start, end);
+        rx_begin(rx, start, end, quiet);
         return HF15_RX_NONE;
     case RX_SOF2: {
         int32_t d = s_q8 - (int32_t)(rx->t0 * 256u);
@@ -109,7 +190,7 @@ hf15_rx_event_t hf15_rx_pause(hf15_rx_t *rx, uint32_t start, uint32_t end) {
             rx->cur = 0;
             rx->len = 0;
         } else {
-            rx_begin(rx, start, end);             /* not a SOF: resynchronise on this pause */
+            rx_begin(rx, start, end, false);      /* not a SOF: resynchronise on this pause */
         }
         return HF15_RX_NONE;
     }
@@ -159,6 +240,7 @@ hf15_rx_event_t hf15_rx_tick(hf15_rx_t *rx, uint32_t now) {
          * plus detection lag): with nothing by 10P the lone pause was an EOF-only frame. */
         if (now_q8 - (int32_t)(rx->t0 * 256u) > 10 * P_Q8) {
             rx->state = RX_IDLE;
+            if (!rx->sof_fresh) break;            /* the tail of a broken request, not a slot marker */
             rx->eof_only++;
             return HF15_RX_EOF_ONLY;
         }
@@ -191,9 +273,8 @@ hf15_rx_event_t hf15_rx_feed(hf15_rx_t *rx, const uint8_t *samples, unsigned n, 
             rx->settle--;
             continue;
         }
-        unsigned m = mag(samples[i]);
-        int32_t m16 = (int32_t)m * 16;
-        if (m > rx->peak_level) rx->peak_level = (uint8_t)m;
+        int32_t m16 = mag16(rx, samples[i]);
+        if (m16 / 16 > rx->peak_level) rx->peak_level = (uint8_t)(m16 / 16 > 255 ? 255 : m16 / 16);
         if (!rx->in_pause) {
             if (rx->level >= RX_MIN_LEVEL && m16 * 2 < rx->level) {
                 if (rx->below++ == 0) rx->cand_start = t;
@@ -237,6 +318,7 @@ hf15_rx_event_t hf15_rx_feed(hf15_rx_t *rx, const uint8_t *samples, unsigned n, 
             }
         } else {
             rx->above = 0;
+            if (m16 * 4 < rx->level) learn_zero(rx, samples[i]);
             if (t - rx->pause_start > RX_GAP_US) {         /* field gone: forget it and re-acquire */
                 if (rx->state != RX_IDLE) {
                     rx->errors++;
@@ -298,6 +380,11 @@ static unsigned win(const uint8_t *s, unsigned n, unsigned ch, int32_t a_q8, int
     return e;
 }
 
+#define TD_MAX_SOF_ATTEMPTS 32u     /* SOF candidates tried per channel/scale (each one H further on) */
+
+static bool td_frame(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8, int32_t sof, unsigned thr,
+                     uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d);
+
 static bool td_try(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8,
                    uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d) {
     if (n < 64u) return false;
@@ -321,16 +408,34 @@ static bool td_try(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8,
     unsigned thr = (noise + peak) / 2u;
 
     /* SOF: three subcarrier halves in a row. First coarse hit, then align on maximum contrast of
-     * S S S U S (the U half and the following S edge are the sharpest timing marks). */
-    int32_t sof = -1;
-    for (int32_t a = (int32_t)TD_NOISE_FROM * 256; (a + 5 * h_q8) >> 8 <= (int32_t)n; a += 256) {
-        if (win(s, n, ch, a, h_q8) > thr && win(s, n, ch, a + h_q8, h_q8) > thr &&
-                win(s, n, ch, a + 2 * h_q8, h_q8) > thr) {
-            sof = a;
-            break;
+     * S S S U S (the U half and the following S edge are the sharpest timing marks). A burst that is
+     * not a valid response (switch-on transient, interference) must not end the search: on any failure
+     * keep scanning after it. */
+    int32_t from = (int32_t)TD_NOISE_FROM * 256;
+    for (unsigned attempt = 0; attempt < TD_MAX_SOF_ATTEMPTS; attempt++) {
+        int32_t sof = -1;
+        for (int32_t a = from; (a + 5 * h_q8) >> 8 <= (int32_t)n; a += 256) {
+            if (win(s, n, ch, a, h_q8) > thr && win(s, n, ch, a + h_q8, h_q8) > thr &&
+                    win(s, n, ch, a + 2 * h_q8, h_q8) > thr) {
+                sof = a;
+                break;
+            }
+        }
+        if (sof < 0) return false;
+        from = sof + h_q8;
+        if (td_frame(s, n, ch, h_q8, sof, thr, out, cap, out_len, d)) {
+            d->noise = (uint16_t)noise;
+            d->peak = (uint16_t)peak;
+            return true;
         }
     }
-    if (sof < 0) return false;
+    return false;
+}
+
+/* One candidate SOF at coarse position `sof`: align, check S S S U S, decode the Manchester data up to
+ * the EOF and verify the CRC. */
+static bool td_frame(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8, int32_t sof, unsigned thr,
+                     uint8_t *out, unsigned cap, unsigned *out_len, hf15_tag_diag_t *d) {
     int32_t best = sof, best_score = -0x7fffffff;
     for (int32_t a = sof - h_q8 / 2; a <= sof + h_q8; a += 128) {
         if (a < 256) continue;
@@ -383,11 +488,9 @@ static bool td_try(const uint8_t *s, unsigned n, unsigned ch, int32_t h_q8,
     }
     if (!eof || (bits & 7u) || bits < 24u) return false;
     unsigned len = bits >> 3;
-    if (!iso15693_check_crc(out, (uint16_t)len)) return false;
+    if (!hf15_check_crc(out, len)) return false;
     /* the EOF-leading bit was written as a 0 into out[]: it lies beyond len, nothing to clear */
     *out_len = len;
-    d->noise = (uint16_t)noise;
-    d->peak = (uint16_t)peak;
     d->sof_sample = (uint16_t)(sof >> 8);
     d->bits = (uint16_t)bits;
     return true;
