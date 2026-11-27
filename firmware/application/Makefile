@@ -39,6 +39,7 @@ SRC_FILES += \
   $(PROJ_DIR)/rfid/st25tb/model.c \
   $(PROJ_DIR)/rfid/st25tb/receiver.c \
   $(PROJ_DIR)/rfid/iso15693/frame.c \
+  $(PROJ_DIR)/rfid/iso15693/model.c \
   $(PROJ_DIR)/rfid/reader/rf_workspace.c \
   $(PROJ_DIR)/utils/rf_timeslot.c \
   $(PROJ_DIR)/rfid/nfctag/lf/lf_tag_em.c \
