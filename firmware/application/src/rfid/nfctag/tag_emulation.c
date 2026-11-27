@@ -10,6 +10,7 @@
 #include "nfc_14a_4.h"
 #include "nfc_seos.h"
 #include "nfc_st25tb.h"   // ST25TB / SRIx (NFC-B) emulation (vendored, GPL-3.0)
+#include "nfc_hf15.h"     // ISO15693 / NFC-V emulation (software radio, same hardware path as ST25TB)
 #include "rgb_marquee.h"
 #include "tag_persistence.h"
 
@@ -122,6 +123,7 @@ static tag_base_handler_map_t tag_base_map[] = {
     {TAG_SENSE_HF, TAG_TYPE_SEOS,        nfc_tag_seos_data_loadcb,     nfc_tag_seos_data_savecb,     nfc_tag_seos_data_factory,     &m_tag_data_hf},
     {TAG_SENSE_HF, TAG_TYPE_ST25TB512_AT, nfc_st25tb_data_loadcb,      nfc_st25tb_data_savecb,       nfc_st25tb_data_factory,       &m_tag_data_hf},
     {TAG_SENSE_HF, TAG_TYPE_ST25TB04K,    nfc_st25tb_data_loadcb,      nfc_st25tb_data_savecb,       nfc_st25tb_data_factory,       &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_ISO15693,     nfc_hf15_data_loadcb,        nfc_hf15_data_savecb,         nfc_hf15_data_factory,         &m_tag_data_hf},
 };
 
 static void tag_emulation_load_config(void);
@@ -404,13 +406,21 @@ static void tag_emulation_sense_switch_all(bool enable) {
         if (IS_ST25TB_TYPE(slotConfig.slots[slot].tag_hf)) {
             // ST25TB (NFC-B): its own radio (NFCT only for field-detect). Keep the 14A path off.
             nfc_tag_14a_sense_switch(false);
+            nfc_hf15_sense_switch(false);      // no-op unless an NFC-V slot was active
             nfc_st25tb_sense_switch(true);
+        } else if (IS_ISO15693_TYPE(slotConfig.slots[slot].tag_hf)) {
+            // NFC-V: its own radio as well (same hardware path as ST25TB). Other HF engines off first.
+            nfc_tag_14a_sense_switch(false);
+            nfc_st25tb_sense_switch(false);
+            nfc_hf15_sense_switch(true);
         } else {
             nfc_st25tb_sense_switch(false);
+            nfc_hf15_sense_switch(false);      // no-op unless an NFC-V slot was active
             nfc_tag_14a_sense_switch(true);
         }
     } else {
         nfc_st25tb_sense_switch(false);
+        nfc_hf15_sense_switch(false);
         nfc_tag_14a_sense_switch(false);
     }
     if (enable && (slotConfig.slots[slot].enabled_lf) && (slotConfig.slots[slot].tag_lf != TAG_TYPE_UNDEFINED)) {
@@ -437,13 +447,20 @@ void tag_emulation_sense_switch(tag_sense_type_t type, bool enable) {
                     (slotConfig.slots[slot].tag_hf != TAG_TYPE_UNDEFINED)) {
                 if (IS_ST25TB_TYPE(slotConfig.slots[slot].tag_hf)) {
                     nfc_tag_14a_sense_switch(false);   // ST25TB uses its own radio, not the 14A (Type-A) path
+                    nfc_hf15_sense_switch(false);      // no-op unless an NFC-V slot was active
                     nfc_st25tb_sense_switch(true);
+                } else if (IS_ISO15693_TYPE(slotConfig.slots[slot].tag_hf)) {
+                    nfc_tag_14a_sense_switch(false);   // NFC-V uses its own radio as well
+                    nfc_st25tb_sense_switch(false);
+                    nfc_hf15_sense_switch(true);
                 } else {
                     nfc_st25tb_sense_switch(false);
+                    nfc_hf15_sense_switch(false);      // no-op unless an NFC-V slot was active
                     nfc_tag_14a_sense_switch(true);
                 }
             } else {
                 nfc_st25tb_sense_switch(false);
+                nfc_hf15_sense_switch(false);
                 nfc_tag_14a_sense_switch(false);
             }
             break;

@@ -97,6 +97,9 @@ typedef enum {
     TAG_TYPE_ST25TB512_AT = 2000,   // 512-bit, 16 blocks
     TAG_TYPE_ST25TB04K = 2001,      // 4K, 128 blocks (ST25TB04K / SRIX4K)
 
+    // ISO15693 / NFC-V emulation   2100 (generic ICODE/SLIX-like; RF reader/emu DA VALIDARE su device)
+    TAG_TYPE_ISO15693 = 2100,
+
     // HF14A-4 series            3000
     TAG_TYPE_HF14A_4 = 3000,
     TAG_TYPE_SEOS,
@@ -128,13 +131,16 @@ typedef enum {
 // ST25TB / SRIx emulation types (512-bit and 4K), both served by the NFC-B radio path.
 #define IS_ST25TB_TYPE(t) ((t) == TAG_TYPE_ST25TB512_AT || (t) == TAG_TYPE_ST25TB04K)
 
+// ISO15693 / NFC-V emulation type (served by the hf15 radio path, nfc_hf15*.c).
+#define IS_ISO15693_TYPE(t) ((t) == TAG_TYPE_ISO15693)
+
 #define TAG_SPECIFIC_TYPE_HF_VALUES                                   \
     TAG_TYPE_MIFARE_Mini, TAG_TYPE_MIFARE_1024, TAG_TYPE_MIFARE_2048, \
         TAG_TYPE_MIFARE_4096, TAG_TYPE_NTAG_213, TAG_TYPE_NTAG_215,   \
         TAG_TYPE_NTAG_216, TAG_TYPE_MF0ICU1, TAG_TYPE_MF0ICU2,        \
         TAG_TYPE_MF0UL11, TAG_TYPE_MF0UL21, TAG_TYPE_NTAG_210,        \
         TAG_TYPE_NTAG_212, TAG_TYPE_HF14A_4, TAG_TYPE_SEOS,          \
-        TAG_TYPE_ST25TB512_AT, TAG_TYPE_ST25TB04K
+        TAG_TYPE_ST25TB512_AT, TAG_TYPE_ST25TB04K, TAG_TYPE_ISO15693
 
 typedef struct {
     tag_specific_type_t tag_hf;

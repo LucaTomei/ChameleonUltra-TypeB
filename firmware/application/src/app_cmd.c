@@ -15,6 +15,8 @@
 #include "nrf_pwr_mgmt.h"
 #include "settings.h"
 #include "nfc_st25tb.h"   // ST25TB emulation (vendored, GPL-3.0) — replaces the old st25tb_emu stub
+#include "nfc_hf15.h"     // ISO15693 / NFC-V emulation (DA VALIDARE su device)
+#include "hf15_reader.h"  // ISO15693 / NFC-V reader (DA VALIDARE su device)
 #include "delayed_reset.h"
 #include "netdata.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -3548,9 +3550,10 @@ static data_frame_tx_t *cmd_processor_hf14b_raw_test(uint16_t cmd, uint16_t stat
 static uint8_t s_hf14b_bb_samples[2048];
 static uint8_t s_hf14b_bb_out[32 + 64 + 2048];
 // SPERIMENTALE: carica un dump ST25TB nell'emulatore NFC-B.
-// payload: uid(8) | nblocks(1) | system(4) | blocks(nblocks*4)
-// Load a real ST25TB512-AT image into the ACTIVE slot (which must already be TAG_TYPE_ST25TB512_AT).
-// Payload = the 77-byte image: UID(8) | 16 blocks x 4 (64) | system block(4) | chip_id(1).
+// Load a real ST25TB image into the ACTIVE slot (which must already be an ST25TB type matching the
+// size). Payload = the full image: 77 byte per il 512-bit — UID(8) | 16 blocchi x4 (64) | system(4) |
+// chip_id(1) — oppure 525 byte per il 4K — UID(8) | 128 blocchi x4 (512) | system(4) | chip_id(1).
+// set_image verifica che la dimensione corrisponda al tipo di slot.
 static data_frame_tx_t *cmd_processor_st25tb_emu_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     (void)status;
     // 77 bytes = 512-bit image, 525 bytes = 4K image. set_image checks it matches the slot type.
@@ -3568,6 +3571,112 @@ static data_frame_tx_t *cmd_processor_st25tb_get_emu(uint16_t cmd, uint16_t stat
     unsigned sz = nfc_st25tb_image_size();
     if (sz != 77 && sz != 525) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     return data_frame_make(cmd, STATUS_SUCCESS, sz, image);
+}
+
+/* ---------------------------------------------------------------- ISO15693 / NFC-V (DA VALIDARE) */
+
+// Load a v1 image (rfid/iso15693/hf15_model.h) into the ACTIVE slot, which must be TAG_TYPE_ISO15693.
+static data_frame_tx_t *cmd_processor_hf15_emu_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status;
+    bool ok = length > 0 && nfc_hf15_set_image(data, length);
+    return data_frame_make(cmd, ok ? STATUS_SUCCESS : STATUS_PAR_ERR, 0, NULL);
+}
+
+// Read back the active NFC-V slot's live image (RF writes included).
+static data_frame_tx_t *cmd_processor_hf15_emu_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status; (void)length; (void)data;
+    unsigned sz = 0;
+    const uint8_t *img = nfc_hf15_image_view(&sz);
+    if (!img || sz == 0) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    return data_frame_make(cmd, STATUS_SUCCESS, (uint16_t)sz, (uint8_t *)img);   // copied into the TX frame
+}
+
+// Emulation decoder/radio counters: pauses, frames, errors, eof_only (u16) | last_error, peak (u8) |
+// last_pause_len, replies, late, windows (u16) | field_known, radio_ok (u8). Big endian.
+static data_frame_tx_t *cmd_processor_hf15_emu_diag(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status; (void)length; (void)data;
+    uint8_t out[32];
+    unsigned n = nfc_hf15_radio_diag(out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, (uint16_t)n, out);
+}
+
+/*
+ * NFC-V reader transceive.
+ * request (BE): u8 flags (bit0 reset + field on first, bit1 keep the field on after, bit2 return raw samples),
+ *               u8 mod_reg, u8 hi, u8 lo, u16 period_q8, u16 n_samples, u32 us_per_sample_q16,
+ *               u8 req_len, req[req_len] (WITHOUT CRC: the firmware appends it)
+ * response:     u8 decoded, u8 channel, u8 scale, u16 sof_sample, u16 noise, u16 peak, u16 bits,
+ *               u16 wave_len, u16 n_samples, u8 resp_len, resp[resp_len] (WITH CRC),
+ *               then if bit2: u16 raw_len, raw samples (at most HF15_RAW_MAX)
+ */
+#define HF15_RAW_MAX 3800u
+static data_frame_tx_t *cmd_processor_hf15_transceive(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    (void)status;
+    if (length < 14) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    hf15_reader_params_t p;
+    uint16_t pos = 0;
+    uint8_t flags = data[pos++];
+    p.mod_reg = data[pos++];
+    p.hi = data[pos++];
+    p.lo = data[pos++];
+    p.period_q8 = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.n_samples = ((uint16_t)data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    p.us_per_sample_q16 = ((uint32_t)data[pos] << 24) | ((uint32_t)data[pos + 1] << 16) |
+                          ((uint32_t)data[pos + 2] << 8) | data[pos + 3];
+    pos += 4;
+    uint8_t req_len = data[pos++];
+    if (req_len == 0 || pos + req_len > length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (flags & 0x01) {
+        pcd_14a_reader_reset();
+        pcd_14a_reader_antenna_on();
+        bsp_delay_ms(8);
+    }
+    static uint8_t resp[96];
+    unsigned resp_len = 0;
+    hf15_reader_result_t res;
+    const uint8_t *raw = NULL;
+    status = hf15_reader_transceive(&p, &data[pos], req_len, resp, sizeof(resp), &resp_len, &res, &raw);
+    if (!(flags & 0x02)) {
+        pcd_14a_reader_antenna_off();
+    }
+    if (status != STATUS_HF_TAG_OK) {
+        return data_frame_make(cmd, status, 0, NULL);
+    }
+    _Static_assert(24u + sizeof(resp) + 2u + HF15_RAW_MAX <= HF15_READER_SCRATCH_BYTES, "hf15 reply too big");
+    uint8_t *o = hf15_reader_scratch();     // free waveform area of the RF workspace: no extra RAM
+    uint16_t n = 0;
+    o[n++] = res.decoded ? 1 : 0;
+    o[n++] = res.diag.channel;
+    o[n++] = res.diag.scale;
+    o[n++] = res.diag.sof_sample >> 8;
+    o[n++] = res.diag.sof_sample & 0xFF;
+    o[n++] = res.diag.noise >> 8;
+    o[n++] = res.diag.noise & 0xFF;
+    o[n++] = res.diag.peak >> 8;
+    o[n++] = res.diag.peak & 0xFF;
+    o[n++] = res.diag.bits >> 8;
+    o[n++] = res.diag.bits & 0xFF;
+    o[n++] = res.wave_len >> 8;
+    o[n++] = res.wave_len & 0xFF;
+    o[n++] = res.n_samples >> 8;
+    o[n++] = res.n_samples & 0xFF;
+    o[n++] = (uint8_t)resp_len;
+    memcpy(&o[n], resp, resp_len);
+    n += resp_len;
+    if ((flags & 0x04) && raw) {
+        uint16_t raw_len = res.n_samples > HF15_RAW_MAX ? HF15_RAW_MAX : res.n_samples;
+        o[n++] = raw_len >> 8;
+        o[n++] = raw_len & 0xFF;
+        memcpy(&o[n], raw, raw_len);
+        n += raw_len;
+    }
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, n, o);
 }
 
 static data_frame_tx_t *cmd_processor_hf14b_bitbang(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -4400,6 +4509,11 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14B_VAULT_LOAD,               NULL,                        cmd_processor_hf14b_vault_load,              NULL                   },
     {    DATA_CMD_HF14B_VAULT_LIST,               NULL,                        cmd_processor_hf14b_vault_list,              NULL                   },
     {    DATA_CMD_HF14B_VAULT_DELETE,             NULL,                        cmd_processor_hf14b_vault_delete,            NULL                   },
+    /* ISO15693 / NFC-V (DA VALIDARE su device): reader transceive needs reader mode, emulation ones do not */
+    {    DATA_CMD_HF15_TRANSCEIVE,                before_reader_run,           cmd_processor_hf15_transceive,               NULL                   },
+    {    DATA_CMD_HF15_EMU_SET,                   NULL,                        cmd_processor_hf15_emu_set,                  NULL                   },
+    {    DATA_CMD_HF15_EMU_GET,                   NULL,                        cmd_processor_hf15_emu_get,                  NULL                   },
+    {    DATA_CMD_HF15_EMU_DIAG,                  NULL,                        cmd_processor_hf15_emu_diag,                 NULL                   },
 #endif
 };
 data_frame_tx_t *cmd_processor_get_device_capabilities(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {

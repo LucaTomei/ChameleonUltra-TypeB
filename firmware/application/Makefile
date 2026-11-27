@@ -36,9 +36,13 @@ SRC_FILES += \
   $(PROJ_DIR)/rfid/nfctag/hf/nfc_seos.c \
   $(PROJ_DIR)/rfid/nfctag/hf/nfc_st25tb.c \
   $(PROJ_DIR)/rfid/nfctag/hf/nfc_st25tb_radio.c \
+  $(PROJ_DIR)/rfid/nfctag/hf/nfc_hf15.c \
+  $(PROJ_DIR)/rfid/nfctag/hf/nfc_hf15_radio.c \
   $(PROJ_DIR)/rfid/st25tb/model.c \
   $(PROJ_DIR)/rfid/st25tb/receiver.c \
   $(PROJ_DIR)/rfid/iso15693/frame.c \
+  $(PROJ_DIR)/rfid/iso15693/hf15_model.c \
+  $(PROJ_DIR)/rfid/iso15693/hf15_codec.c \
   $(PROJ_DIR)/rfid/reader/rf_workspace.c \
   $(PROJ_DIR)/utils/rf_timeslot.c \
   $(PROJ_DIR)/rfid/nfctag/lf/lf_tag_em.c \
@@ -362,6 +366,7 @@ ifeq	(${CURRENT_DEVICE_TYPE}, ${CHAMELEON_ULTRA})
   SRC_FILES +=\
     $(PROJ_DIR)/rfid/reader/hf/mf1_toolbox.c \
     $(PROJ_DIR)/rfid/reader/hf/rc522.c \
+    $(PROJ_DIR)/rfid/reader/hf/hf15_reader.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_125khz_radio.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_em410x_data.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_em4x05_data.c \

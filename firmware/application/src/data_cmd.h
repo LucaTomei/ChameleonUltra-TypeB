@@ -110,6 +110,12 @@
 #define DATA_CMD_ST25TB_GET_EMU                 (2065)  /* diagnostica: rilegge l'immagine ST25TB emulata dallo slot attivo (77/525 byte, stesso layout di EMU_SET) */
 #define DATA_CMD_GET_RESET_SOURCE               (2066)  /* diagnostica: causa dell'ultimo reset (RESETREAS) + GPREGRET letti al boot. payload: reason(u32 LE) | gpregret(u32 LE) */
 
+/* ISO15693 / NFC-V (software radio). DA VALIDARE su device. Image layout v1: see rfid/iso15693/hf15_model.h */
+#define DATA_CMD_HF15_TRANSCEIVE                (2300)  /* reader: send one request (CRC added by the firmware), return the decoded reply + diagnostics */
+#define DATA_CMD_HF15_EMU_SET                   (2301)  /* load a v1 image into the active slot (slot type must be TAG_TYPE_ISO15693) */
+#define DATA_CMD_HF15_EMU_GET                   (2302)  /* read back the active slot's emulated image (v1) */
+#define DATA_CMD_HF15_EMU_DIAG                  (2303)  /* emulation decoder/radio counters (big endian), for tuning */
+
 //
 // ******************************************************************
 

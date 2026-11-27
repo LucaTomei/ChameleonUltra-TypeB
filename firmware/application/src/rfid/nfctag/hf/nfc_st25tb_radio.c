@@ -72,7 +72,6 @@ enum {
     STB_IDLE_WINDOW_US = 500000,
     STB_SERVICE_WINDOW_US = 25000,
     STB_USB_WINDOW_US = 500000,
-    STB_BLE_WINDOW_US = 400000,       /* app BLE connessa: finestra piu' corta per lasciare respiro alla connessione (vedi F1) */
     STB_TX_BYTE_BUDGET_US = 100,
     STB_TX_GUARD_US = 2500,
     STB_POWER_SETTLE_MS = 1,
@@ -601,10 +600,10 @@ static void stb_window(void) {
         if (nrf_gpio_pin_read(BUTTON_1) || nrf_gpio_pin_read(BUTTON_2)) {
             break;
         }
-        // Feed the watchdog DURING the window. The WDT times out at 2 s (WDT_CONFIG_RELOAD_VALUE),
-        // and an active window can run that long while a reader streams a big read (a 4K card's 128
-        // blocks keep the loop busy for ~2 s) — the single feed before the window is then not enough
-        // and the device resets mid-read. Throttle to ~every 100 ms so it costs nothing.
+        // Feed the watchdog DURING the window. The WDT times out at 8 s (WDT_CONFIG_RELOAD_VALUE),
+        // and an active window can run up to 2 s while a reader streams a big read (a 4K card's 128
+        // blocks keep the loop busy that long) — the single feed before the window is then not enough
+        // and the device could reset mid-read. Throttle to ~every 100 ms so it costs nothing.
         if (DWT->CYCCNT - last_wdt > 100000u * STB_CPU_CYCLES_PER_US) {
             bsp_wdt_feed();
             last_wdt = DWT->CYCCNT;
