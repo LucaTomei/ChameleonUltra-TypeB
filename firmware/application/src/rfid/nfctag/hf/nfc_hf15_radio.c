@@ -105,9 +105,14 @@ enum {
     HFV_LOCK_GAP_1OF256 = 704000,
     HFV_LOCK_SOF_TIMEOUT_CYCLES = 640000,       /* ~10 ms with no SOF -> bail, re-check the field */
     HFV_LOCK_FRAME_TIMEOUT_CYCLES = 1920000,    /* ~30 ms: a real request completes in a few ms */
-    /* Detector timestamp (EOF pause falling edge) to the SOF start at 64 MHz. ISO15693 t1 ~= 320.9 us;
-     * the SOF begins with 56.64 us of silence. DA VALIDARE / tune this one constant with a scope. */
-    HFV_LOCK_RESPONSE_WAIT_CYCLES = 20508,
+    /* Detector timestamp (EOF pause) to the FIRST SUBCARRIER PULSE of the reply, at 64 MHz.
+     * ISO15693: t1 ~= 320.9 us to the SOF start (20508 cycles), and the SOF begins with 3 unmodulated
+     * half-bits = 56.64 us (3625 cycles). The packed stream from hf15_tag_pack starts directly at the
+     * first pulse (S S S U S, no silent lead), so the lead belongs in this delay; hfv_transmit adds its
+     * 128-cycle start margin: 20508 + 3625 - 128. (Was 20508: the first pulse went out ~55 us before the
+     * nominal — tolerated by the Flipper, but readers that expect the standard timing may miss the SOF.)
+     * DA VALIDARE / tune this one constant with a scope. */
+    HFV_LOCK_RESPONSE_WAIT_CYCLES = 24005,
     HFV_LOCK_EOF_POSITION = 2,
     HFV_LOCK_MIN_FRAME_BYTES = 4,
 };
@@ -304,8 +309,8 @@ static void hfv_nfct_sense_activate(void) {
 
 /* Decode one reader frame from the NFCT LOCKDETECT edges. Returns 1 with the frame (CRC bytes included)
  * in frame[0..*len_out) and the EOF falling-edge timestamp in *eof_cyc, or 0 if no frame completed
- * before the timeout / the field dropped. RAM function so the polling stays tight. IRQ stays on (proven
- * clean on device); a rare preemption only makes one frame malformed and the reader retries. */
+ * before the timeout / the field dropped. RAM function so the polling stays tight. The caller runs it
+ * with IRQs disabled (see hfv_window); the timeouts and the timeslot deadline bound that stretch. */
 __attribute__((section(".data.hf15"), noinline, aligned(4))) static int
 hfv_lock_receive(uint8_t *frame, unsigned *len_out, uint32_t *eof_cyc, uint32_t deadline) {
     uint32_t rx_start = DWT->CYCCNT;
@@ -380,7 +385,9 @@ hfv_lock_receive(uint8_t *frame, unsigned *len_out, uint32_t *eof_cyc, uint32_t 
                            (c256 || !(sym_count % 4u))) {
                     *len_out = c256 ? sym_count : sym_count / 4u;
                     *eof_cyc = now;
-                    if (w) { hfv_cap_wr = w; hfv_cap_frozen = true; }
+                    /* Freeze on the first frame only: once frozen `w` starts at HFV_CAP_SIZE, and storing
+                     * it would make the host read stale entries as part of the captured frame. */
+                    if (w && !hfv_cap_frozen) { hfv_cap_wr = w; hfv_cap_frozen = true; }
                     return 1;
                 } else {
                     sof = false;
@@ -454,6 +461,10 @@ static void hfv_window(void) {
             }
             continue;
         }
+        /* Field seen again: a single FIELDPRESENT=0 sample (NFCT not READY yet at window start or right
+         * after a reply) must not stay armed, or the next one — even a window later — declares the field
+         * lost at once and resets the tag's Selected/Quiet state. Same as the ST25TB field probe. */
+        hfv_absence_pending = false;
         unsigned flen = 0;
         uint32_t eof_cyc = 0;
         /* Receive AND reply run with IRQ disabled so neither the PPM symbol timing nor the 423.75 kHz
@@ -548,11 +559,15 @@ bool nfc_hf15_radio_poll(bool *field_present, bool active) {
 }
 
 void nfc_hf15_radio_stop(void) {
-    if (!reader_open) {
-        return;
+    if (reader_open) {
+        close_reader();
+        reader_open = false;
     }
-    close_reader();
-    reader_open = false;
+    /* close_reader() leaves the RC522 powered (the idle windows reopen it right away): when NFC-V stops
+     * — slot switched to Type-A / LF, field lost — power it down like the ST25TB radio does, so it does
+     * not drain the battery or sit powered next to the NFCT during Type-A emulation. The next poll
+     * powers it up again in open_reader(). */
+    nrf_gpio_pin_clear(READER_POWER);
     hfv_field_known = false;
     hfv_absence_pending = false;
 }

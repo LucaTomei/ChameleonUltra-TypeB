@@ -115,7 +115,7 @@
 #define DATA_CMD_HF15_EMU_SET                   (2301)  /* load a v1 image into the active slot (slot type must be TAG_TYPE_ISO15693) */
 #define DATA_CMD_HF15_EMU_GET                   (2302)  /* read back the active slot's emulated image (v1) */
 #define DATA_CMD_HF15_EMU_DIAG                  (2303)  /* emulation decoder/radio counters (big endian), for tuning */
-#define DATA_CMD_HF15_EMU_CAPTURE               (2304)  /* DEBUG bring-up: scarica il ring di campioni ADC grezzi dell emulazione (req: offset u16 LE; resp: wr u16 LE + slice) */
+#define DATA_CMD_HF15_EMU_CAPTURE               (2304)  /* DEBUG bring-up: log dei fronti LOCKDETECT dell emulazione, entry da 4 byte (req: offset u16 LE, 0xFFFF = riarma; resp: wr u16 LE + slice) */
 
 //
 // ******************************************************************

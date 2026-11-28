@@ -3591,8 +3591,13 @@ static data_frame_tx_t *cmd_processor_hf15_emu_get(uint16_t cmd, uint16_t status
     return data_frame_make(cmd, STATUS_SUCCESS, (uint16_t)sz, (uint8_t *)img);   // copied into the TX frame
 }
 
-// Emulation decoder/radio counters: pauses, frames, errors, eof_only (u16) | last_error, peak (u8) |
-// last_pause_len, replies, late, windows (u16) | field_known, radio_ok (u8). Big endian.
+// Emulation decoder/radio counters, big endian, 28 bytes: pauses, frames, errors, eof_only (u16) |
+// last_error, peak (u8) | last_pause_len, replies, late, windows (u16) | field_known, radio_ok (u8) |
+// zero_i, zero_q (i32). With the NFCT lock-detector receiver: pauses = LOCKDETECT edges (2 per pause),
+// frames = requests decoded up to the EOF (CRC not checked), errors = symbols off the grid after a SOF,
+// late = requests left without a reply (bad CRC, not for this tag, unsupported, no time left in the
+// window); eof_only, last_error, peak, last_pause_len, zero_i/q are 0 (ADC receiver only). The app
+// reads the first 20 bytes.
 static data_frame_tx_t *cmd_processor_hf15_emu_diag(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     (void)status; (void)length; (void)data;
     uint8_t out[32];
@@ -3600,8 +3605,9 @@ static data_frame_tx_t *cmd_processor_hf15_emu_diag(uint16_t cmd, uint16_t statu
     return data_frame_make(cmd, STATUS_SUCCESS, (uint16_t)n, out);
 }
 
-// DEBUG bring-up: dump a slice of the emulation RX raw-ADC ring. req: u16 offset (LE). resp: u16 wr (LE,
-// current ring write index) + up to 250 raw bytes from that offset. Host reorders oldest->newest by wr.
+// DEBUG bring-up: dump a slice of the emulation RX edge log (4-byte entries: 31-bit DWT-cycle delta from
+// the receive start | top bit = LOCKDETECT state). req: u16 offset (LE; 0xFFFF = re-arm). resp: u16 wr
+// (LE, bytes captured when the log froze on the first decoded frame) + up to 250 bytes from that offset.
 extern unsigned nfc_hf15_radio_capture(uint8_t *out, unsigned offset, unsigned max, unsigned *wr_out);
 static data_frame_tx_t *cmd_processor_hf15_emu_capture(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     (void)status;

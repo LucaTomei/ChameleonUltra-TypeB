@@ -1,7 +1,7 @@
 hf15_codec_test
 
 # host capture-replay build artifacts
-tests/hf15/cap_dbg
-tests/hf15/cap_decode
-tests/hf15/cap_pos
-tests/hf15/codec_dbg.c
+cap_dbg
+cap_decode
+cap_pos
+codec_dbg.c

@@ -176,18 +176,31 @@ packages (`ultra-dfu-app.zip`, ...) and the CLI clients for Linux, macOS and Win
   15/15 with the tag offset by 1 cm, lifted a few millimetres and rotated by 90 degrees.
 - Slow: every exchange goes through USB and host-side demodulation.
 
-## NFC-V (ISO15693) — sperimentale, DA VALIDARE su device
+## NFC-V (ISO15693)
 
-Software radio on the same HF hardware as the ST25TB emulation (RC522 field-off ADC sampling +
-GPIO load modulation), commands `2300`-`2303`, slot tag type `2100`. Ultra only.
+Commands `2300`-`2303` (+ debug `2304`), slot tag type `2100`. Ultra only.
 
-- Reader → tag: only **100% OOK** requests are decoded (Flipper Zero, phones, Proxmark). 10% ASK
-  readers are not seen: on the 4-bit RC522 ADC a 10% dip is below the noise.
-- Tag → reader: high data rate, one subcarrier (fc/32). A request asking for the low data rate or
-  two subcarriers gets the high-rate reply anyway (most readers use the high rate).
-- Replies up to 160 bytes (Read Multiple Blocks of up to ~38 four-byte blocks per request); a bigger
-  request gets error `0x0F`.
-- The emulation decoder learns the ADC zero inside the reader's pauses, so a small DC offset of the
-  ADC does not hide them; `HF15_EMU_DIAG` reports pauses/frames/replies/late to tune on hardware.
-- The Chameleon reader reads replies up to ~27 bytes per request (single-block reads are used).
+**Emulation** (validated on device with a Flipper Zero: Inventory + Get System Info + block reads):
+- Reader → tag: the reader's pulse-position modulation is recovered from the nRF52 NFCT carrier
+  lock detector (`FIELDPRESENT.LOCKDETECT`), edges timestamped with `DWT->CYCCNT`, 1-out-of-4 decode
+  in software (`nfc_hf15_radio.c`). `HF_ANT_SEL` stays HIGH (antenna routed to the NFCT) while
+  receiving. Needs **100% OOK** readers (Flipper Zero, phones, Proxmark); 10% ASK does not drop the
+  carrier lock and is not seen.
+- Tag → reader: load modulation at fc/32 bit-banged on `HF_ANT_SEL`, high data rate, one subcarrier.
+  A request asking for the low data rate or two subcarriers gets the high-rate reply anyway. First
+  subcarrier pulse 377 us after the EOF (ISO t1 + the 56.6 us unmodulated SOF lead) — one constant,
+  `HFV_LOCK_RESPONSE_WAIT_CYCLES`, to tune with a scope.
+- Receive + reply run with interrupts disabled inside a radio timeslot, bounded by its deadline.
+- Known limits: 16-slot inventory answers only in slot 0 (EOF-only slot markers are not handled; the
+  Flipper and phones use 1-slot inventory); 1-out-of-256 requests longer than ~5 bytes time out;
+  replies up to 160 bytes (bigger requests get error `0x0F`); under heavy BLE traffic the first
+  request after the field appears can be missed (short idle windows) and the reader retries.
+- `HF15_EMU_DIAG` (28 bytes, layout in `app_cmd.c`): LOCKDETECT edges, requests decoded, replies
+  sent, requests left unanswered. `HF15_EMU_CAPTURE` (`2304`) dumps the edge log of the first decoded
+  frame for host-side analysis.
 - Not modelled: SLIX passwords / privacy mode, AFI family matching, the Write/Lock option flag.
+
+**Reader** (DA VALIDARE su device): RC522 waveform burst + ADC sampling, subcarrier decoded on
+device (`hf15_reader.c`, `hf15_codec.c`). Replies up to ~27 bytes per request (single-block reads).
+The ADC-sample request decoder in `hf15_codec.c` (`hf15_rx_*`) is no longer used by the emulation; it
+is kept with its host tests (`firmware/tests/hf15`).
